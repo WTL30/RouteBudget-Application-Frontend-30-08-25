@@ -687,7 +687,7 @@ const FastTagPaymentScreen: React.FC<FastTagPaymentScreenProps> = ({ onClose }) 
       const token = await AsyncStorage.getItem("userToken")
 
       if (token) {
-        const response = await axios.get("https://api.routebudget.com/api/assignCab/driver", {
+        const response = await axios.get("http://192.168.1.5:5000/api/assignCab/driver", {
           headers: { Authorization: `Bearer ${token}` },
         })
 
@@ -764,7 +764,7 @@ const FastTagPaymentScreen: React.FC<FastTagPaymentScreenProps> = ({ onClose }) 
           },
         }
 
-        const res = await axios.patch("https://api.routebudget.com/api/assigncab/update-trip", formData, uploadConfig)
+        const res = await axios.patch("http://192.168.1.5:5000/api/assigncab/update-trip", formData, uploadConfig)
 
         if (res.status === 200 || res.status === 201) {
           Alert.alert("Success", "FastTag payment submitted successfully!", [

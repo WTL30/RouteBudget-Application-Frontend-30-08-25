@@ -1,7 +1,7 @@
 "use client"
 
 import type React from "react"
-import { useEffect, useState, useRef } from "react"
+import { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import {
   View,
   Text,
@@ -15,7 +15,6 @@ import {
   Modal,
   PermissionsAndroid,
   Platform,
-  Linking, // Added Linking import for phone dialer functionality
 } from "react-native"
 import AsyncStorage from "@react-native-async-storage/async-storage"
 import axios from "react-native-axios"
@@ -23,7 +22,11 @@ import MaterialIcons from "react-native-vector-icons/MaterialIcons"
 import MapView, { PROVIDER_GOOGLE, Marker, Polyline } from "react-native-maps"
 import Geolocation from "@react-native-community/geolocation"
 
+import { API_BASE_URL, GOOGLE_MAPS_API_KEY, WS_BASE_URL } from "../utils/config"
+
 const { width, height } = Dimensions.get("window")
+
+type TripPhase = "idle" | "to_pickup" | "pickup_reached" | "to_drop" | "completed"
 
 interface TripData {
   customerName: string | null
@@ -41,6 +44,12 @@ interface TripData {
   dropTime: string | null
   specialInstructions: string | null
   adminNotes: string | null
+  id?: number | null
+  driverId?: number | null
+  pickupLatitude?: number | null
+  pickupLongitude?: number | null
+  dropLatitude?: number | null
+  dropLongitude?: number | null
 }
 
 interface CustomerDetailScreenProps {
@@ -61,7 +70,6 @@ const CustomerDetailScreen: React.FC<CustomerDetailScreenProps> = ({ onClose }) 
   const [fadeAnim] = useState(new Animated.Value(0))
   const [slideAnim] = useState(new Animated.Value(20))
 
-  // Map related states
   const [showMapModal, setShowMapModal] = useState<boolean>(false)
   const [currentLocation, setCurrentLocation] = useState<LocationCoords | null>(null)
   const [pickupCoords, setPickupCoords] = useState<LocationCoords | null>(null)
@@ -70,12 +78,35 @@ const CustomerDetailScreen: React.FC<CustomerDetailScreenProps> = ({ onClose }) 
   const [polylineCoords, setPolylineCoords] = useState<LocationCoords[]>([])
   const [mapMode, setMapMode] = useState<MapMode>("full")
   const [watchId, setWatchId] = useState<number | null>(null)
+  const [tripPhase, setTripPhase] = useState<TripPhase>("idle")
+  const [isSocketConnected, setIsSocketConnected] = useState(false)
+  const [viewerId, setViewerId] = useState<string | null>(null)
+  const [driverId, setDriverId] = useState<string | null>(null)
   const mapRef = useRef<MapView | null>(null)
+  const websocketRef = useRef<WebSocket | null>(null)
+  const reconnectTimeoutRef = useRef<{ timeout: NodeJS.Timeout | null; retryCount: number }>({
+    timeout: null,
+    retryCount: 0,
+  })
+
+  const lastConnectionAttemptRef = useRef<number>(0)
+  const CONNECTION_COOLDOWN = 2000 // 2 seconds cooldown between connection attempts
+  const pendingRouteRef = useRef<{ origin: LocationCoords; destination: LocationCoords } | null>(null)
+
+  const closeMapModal = useCallback(() => {
+    console.log("Closing map modal")
+    setShowMapModal(false)
+    setMapMode("full")
+    setMapLoading(false)
+    setPolylineCoords([])
+    // Clear pending route
+    pendingRouteRef.current = null
+  }, [])
 
   useEffect(() => {
     const initializeScreen = async () => {
+      await loadViewerIdentifier()
       await getAssignedCab()
-      await requestLocationPermission()
       startAnimations()
     }
     initializeScreen()
@@ -84,6 +115,7 @@ const CustomerDetailScreen: React.FC<CustomerDetailScreenProps> = ({ onClose }) 
       if (watchId !== null) {
         Geolocation.clearWatch(watchId)
       }
+      cleanupSocket()
     }
   }, [])
 
@@ -154,8 +186,8 @@ const CustomerDetailScreen: React.FC<CustomerDetailScreenProps> = ({ onClose }) 
         },
         {
           enableHighAccuracy: true,
-          timeout: 10000, // 10 seconds for high accuracy
-          maximumAge: 10000, // Allow 10 second old location
+          timeout: 10000,
+          maximumAge: 10000,
         },
       )
     }
@@ -185,13 +217,13 @@ const CustomerDetailScreen: React.FC<CustomerDetailScreenProps> = ({ onClose }) 
           console.log("Location error:", error)
           let errorMessage = "Unable to get your current location. "
           switch (error.code) {
-            case 1: // PERMISSION_DENIED
+            case 1:
               errorMessage += "Please enable location permissions in settings."
               break
-            case 2: // POSITION_UNAVAILABLE
+            case 2:
               errorMessage += "Location services are not available. Please check your GPS settings."
               break
-            case 3: // TIMEOUT
+            case 3:
               errorMessage += "Location request timed out. Please ensure you have a good GPS signal and try again."
               break
             default:
@@ -200,14 +232,13 @@ const CustomerDetailScreen: React.FC<CustomerDetailScreenProps> = ({ onClose }) 
           Alert.alert("Location Error", errorMessage)
         },
         {
-          enableHighAccuracy: false, // Use network/wifi location
-          timeout: 15000, // 15 seconds for low accuracy
-          maximumAge: 30000, // Allow 30 second old location
+          enableHighAccuracy: false,
+          timeout: 15000,
+          maximumAge: 30000,
         },
       )
     }
 
-    // Start with high accuracy attempt
     tryHighAccuracy()
   }
 
@@ -223,9 +254,9 @@ const CustomerDetailScreen: React.FC<CustomerDetailScreenProps> = ({ onClose }) 
         console.log("Location tracking error:", error)
       },
       {
-        enableHighAccuracy: false, // Use network location for continuous tracking
+        enableHighAccuracy: false,
         timeout: 20000,
-        maximumAge: 10000, // Allow 10 second old locations for tracking
+        maximumAge: 10000,
         distanceFilter: 5,
       },
     )
@@ -234,9 +265,8 @@ const CustomerDetailScreen: React.FC<CustomerDetailScreenProps> = ({ onClose }) 
 
   const geocodeAddress = async (address: string): Promise<LocationCoords | null> => {
     try {
-      const API_KEY = "AIzaSyAKjmBSUJ3XR8uD10vG2ptzqLJAZnOlzqI"
       const response = await axios.get(
-        `https://maps.googleapis.com/maps/api/geocode/json?address=${encodeURIComponent(address)}&key=${API_KEY}`,
+        `https://maps.googleapis.com/maps/api/geocode/json?address=${encodeURIComponent(address)}&key=${GOOGLE_MAPS_API_KEY}`,
       )
 
       if (response.data.results && response.data.results.length > 0) {
@@ -255,9 +285,8 @@ const CustomerDetailScreen: React.FC<CustomerDetailScreenProps> = ({ onClose }) 
 
   const getDirections = async (origin: LocationCoords, destination: LocationCoords) => {
     try {
-      const API_KEY = "AIzaSyAKjmBSUJ3XR8uD10vG2ptzqLJAZnOlzqI"
       const response = await axios.get(
-        `https://maps.googleapis.com/maps/api/directions/json?origin=${origin.latitude},${origin.longitude}&destination=${destination.latitude},${destination.longitude}&key=${API_KEY}`,
+        `https://maps.googleapis.com/maps/api/directions/json?origin=${origin.latitude},${origin.longitude}&destination=${destination.latitude},${destination.longitude}&key=${GOOGLE_MAPS_API_KEY}`,
       )
 
       if (response.data.routes && response.data.routes.length > 0) {
@@ -308,28 +337,63 @@ const CustomerDetailScreen: React.FC<CustomerDetailScreenProps> = ({ onClose }) 
     return poly
   }
 
-  const handleTrackLocation = async () => {
-    if (!tripData?.pickupLocation || !tripData?.dropLocation) {
-      Alert.alert("Error", "Pickup and drop locations are required for tracking.")
-      return
+  const ensurePickupDropCoordinates = useCallback(async () => {
+    let ensuredPickup = pickupCoords
+    let ensuredDrop = dropCoords
+
+    try {
+      if (!ensuredPickup && tripData?.pickupLocation) {
+        console.log("Geocoding pickup address", tripData.pickupLocation)
+        ensuredPickup = await geocodeAddress(tripData.pickupLocation)
+        if (ensuredPickup) {
+          setPickupCoords(ensuredPickup)
+          console.log("Geocoded pickup ->", ensuredPickup)
+          // Don't set shouldConnectSocket here - only connect when database coords are available
+        }
+      }
+
+      if (!ensuredDrop && tripData?.dropLocation) {
+        console.log("Geocoding drop address", tripData.dropLocation)
+        ensuredDrop = await geocodeAddress(tripData.dropLocation)
+        if (ensuredDrop) {
+          setDropCoords(ensuredDrop)
+          console.log("Geocoded drop ->", ensuredDrop)
+          // Don't set shouldConnectSocket here - only connect when database coords are available
+        }
+      }
+    } catch (error) {
+      console.log("Error ensuring pickup/drop coordinates:", error)
     }
 
+    if (ensuredPickup && ensuredDrop) {
+      return { pickup: ensuredPickup, drop: ensuredDrop }
+    }
+
+    return null
+  }, [dropCoords, geocodeAddress, pickupCoords, tripData])
+
+  const handleTrackLocation = async () => {
     setMapLoading(true)
     setShowMapModal(true)
     setMapMode("full")
 
     try {
-      const pickup = await geocodeAddress(tripData.pickupLocation)
-      const drop = await geocodeAddress(tripData.dropLocation)
-
-      if (pickup && drop) {
-        setPickupCoords(pickup)
-        setDropCoords(drop)
-        const directions = await getDirections(pickup, drop)
-        setPolylineCoords(directions)
-      } else {
-        Alert.alert("Error", "Could not find coordinates for the locations.")
+      const ensured = await ensurePickupDropCoordinates()
+      if (!ensured) {
+        Alert.alert(
+          "Route unavailable",
+          "Could not determine pickup and drop coordinates. Please ask the driver to submit them or try again shortly.",
+        )
+        return
       }
+
+      console.log("handleTrackLocation using coords", ensured)
+      const directions = await getDirections(ensured.pickup, ensured.drop)
+      console.log("handleTrackLocation polyline points", directions.length)
+      setPolylineCoords(directions)
+      setPickupCoords(ensured.pickup)
+      setDropCoords(ensured.drop)
+      pendingRouteRef.current = { origin: ensured.pickup, destination: ensured.drop }
     } catch (error) {
       console.log("Track location error:", error)
       Alert.alert("Error", "Failed to load map data.")
@@ -339,188 +403,52 @@ const CustomerDetailScreen: React.FC<CustomerDetailScreenProps> = ({ onClose }) 
   }
 
   const handleStartToPickup = async () => {
+    if (!currentLocation || !pickupCoords) {
+      Alert.alert("Route unavailable", "Waiting for the driver's live location and pickup coordinate.")
+      return
+    }
+
     setMapLoading(true)
     setMapMode("toPickup")
     setShowMapModal(true)
 
     try {
-      // First request location permission and get current location
-      if (Platform.OS === "android") {
-        const granted = await PermissionsAndroid.requestMultiple([
-          PermissionsAndroid.PERMISSIONS.ACCESS_FINE_LOCATION,
-          PermissionsAndroid.PERMISSIONS.ACCESS_COARSE_LOCATION,
-        ])
-
-        if (
-          granted["android.permission.ACCESS_FINE_LOCATION"] !== PermissionsAndroid.RESULTS.GRANTED ||
-          granted["android.permission.ACCESS_COARSE_LOCATION"] !== PermissionsAndroid.RESULTS.GRANTED
-        ) {
-          Alert.alert("Permission Required", "Location permission is required to track your location.")
-          setMapLoading(false)
-          return
-        }
-      }
-
-      const getCurrentLocationForPickup = () => {
-        return new Promise((resolve, reject) => {
-          // Try high accuracy first
-          Geolocation.getCurrentPosition(
-            (position) => {
-              resolve({
-                latitude: position.coords.latitude,
-                longitude: position.coords.longitude,
-              })
-            },
-            (error) => {
-              console.log("High accuracy failed, trying low accuracy:", error)
-              // Fallback to low accuracy
-              Geolocation.getCurrentPosition(
-                (position) => {
-                  resolve({
-                    latitude: position.coords.latitude,
-                    longitude: position.coords.longitude,
-                  })
-                },
-                (fallbackError) => {
-                  reject(fallbackError)
-                },
-                {
-                  enableHighAccuracy: false,
-                  timeout: 15000,
-                  maximumAge: 30000,
-                },
-              )
-            },
-            {
-              enableHighAccuracy: true,
-              timeout: 10000,
-              maximumAge: 10000,
-            },
-          )
-        })
-      }
-
-      try {
-        const userLocation = await getCurrentLocationForPickup()
-        setCurrentLocation(userLocation)
-
-        if (mapRef.current) {
-          mapRef.current.animateToRegion(
-            {
-              latitude: userLocation.latitude,
-              longitude: userLocation.longitude,
-              latitudeDelta: 0.004,
-              longitudeDelta: 0.004,
-            },
-            1500,
-          )
-        }
-
-        // Start location tracking with better configuration
-        const watchId = Geolocation.watchPosition(
-          (position) => {
-            const newLocation = {
-              latitude: position.coords.latitude,
-              longitude: position.coords.longitude,
-            }
-            setCurrentLocation(newLocation)
-
-            if (mapRef.current && mapMode === "toPickup") {
-              mapRef.current.animateToRegion(
-                {
-                  latitude: newLocation.latitude,
-                  longitude: newLocation.longitude,
-                  latitudeDelta: 0.004,
-                  longitudeDelta: 0.004,
-                },
-                500,
-              )
-            }
-          },
-          (error) => {
-            console.log("Location tracking error:", error)
-          },
-          {
-            enableHighAccuracy: false, // Use network location for better reliability
-            timeout: 20000,
-            maximumAge: 10000, // Allow cached locations
-            distanceFilter: 2,
-          },
-        )
-        setWatchId(watchId)
-
-        // Get pickup coordinates and directions
-        if (tripData?.pickupLocation) {
-          const pickup = await geocodeAddress(tripData.pickupLocation)
-          if (pickup) {
-            setPickupCoords(pickup)
-            const directions = await getDirections(userLocation, pickup)
-            setPolylineCoords(directions)
-
-            if (mapRef.current) {
-              const midLat = (userLocation.latitude + pickup.latitude) / 2
-              const midLng = (userLocation.longitude + pickup.longitude) / 2
-              const latDelta = Math.abs(userLocation.latitude - pickup.latitude) * 1.8
-              const lngDelta = Math.abs(userLocation.longitude - pickup.longitude) * 1.8
-
-              mapRef.current.animateToRegion(
-                {
-                  latitude: midLat,
-                  longitude: midLng,
-                  latitudeDelta: Math.max(latDelta, 0.01),
-                  longitudeDelta: Math.max(lngDelta, 0.01),
-                },
-                2000,
-              )
-            }
-          }
-        }
-      } catch (locationError) {
-        console.log("Location error:", locationError)
-        let errorMessage = "Unable to get your current location. "
-        switch (locationError.code) {
-          case 1:
-            errorMessage += "Please enable location permissions in settings."
-            break
-          case 2:
-            errorMessage += "Location services are not available. Please check your GPS settings."
-            break
-          case 3:
-            errorMessage += "Location request timed out. Please ensure you have a good GPS signal and try again."
-            break
-          default:
-            errorMessage += "Please check your GPS settings and try again."
-        }
-        Alert.alert("Location Error", errorMessage)
-      }
-
-      setMapLoading(false)
+      console.log("handleStartToPickup origin", currentLocation, "dest", pickupCoords)
+      const directions = await getDirections(currentLocation, pickupCoords)
+      console.log("handleStartToPickup polyline points", directions.length)
+      setPolylineCoords(directions)
+      pendingRouteRef.current = { origin: currentLocation, destination: pickupCoords }
     } catch (error) {
       console.log("Start to pickup error:", error)
-      setMapLoading(false)
       Alert.alert("Error", "Failed to get route to pickup location.")
+    } finally {
+      setMapLoading(false)
     }
   }
 
   const handlePickupToDrop = async () => {
-    if (!tripData?.pickupLocation || !tripData?.dropLocation) {
-      Alert.alert("Error", "Pickup and drop locations are required.")
-      return
-    }
-
+    console.log("handlePickupToDrop called")
     setMapLoading(true)
     setMapMode("pickupToDrop")
 
     try {
-      const pickup = await geocodeAddress(tripData.pickupLocation)
-      const drop = await geocodeAddress(tripData.dropLocation)
-
-      if (pickup && drop) {
-        setPickupCoords(pickup)
-        setDropCoords(drop)
-        const directions = await getDirections(pickup, drop)
-        setPolylineCoords(directions)
+      const ensured = await ensurePickupDropCoordinates()
+      if (!ensured) {
+        Alert.alert(
+          "Route unavailable",
+          "Could not determine pickup and drop coordinates. Please ask the driver to submit them or try again shortly.",
+        )
+        return
       }
+
+      console.log("Fetching pickup->drop directions", ensured)
+      const directions = await getDirections(ensured.pickup, ensured.drop)
+      console.log("handlePickupToDrop polyline points", directions.length)
+      setPolylineCoords(directions)
+      setPickupCoords(ensured.pickup)
+      setDropCoords(ensured.drop)
+      pendingRouteRef.current = { origin: ensured.pickup, destination: ensured.drop }
+      console.log("Loaded pickup->drop polyline", directions.length)
     } catch (error) {
       console.log("Pickup to drop error:", error)
       Alert.alert("Error", "Failed to get route from pickup to drop location.")
@@ -529,21 +457,54 @@ const CustomerDetailScreen: React.FC<CustomerDetailScreenProps> = ({ onClose }) 
     }
   }
 
+  useEffect(() => {
+    // Only ensure coordinates when we actually need them for the map or when explicitly requested
+    // Don't run this when coordinates are null and user hasn't opened the map
+    if (tripData?.pickupLocation || tripData?.dropLocation) {
+      // Only run geocoding if:
+      // 1. We don't have database coordinates, OR
+      // 2. User has opened the map modal
+      const hasDatabaseCoords = tripData?.pickupLatitude && tripData?.dropLatitude
+      const shouldGeocode = !hasDatabaseCoords || showMapModal
+
+      if (shouldGeocode) {
+        console.log("Trip data available, ensuring coordinates", {
+          pickupLocation: tripData?.pickupLocation,
+          dropLocation: tripData?.dropLocation,
+          pickupLatitude: tripData?.pickupLatitude,
+          dropLatitude: tripData?.dropLatitude,
+          hasDatabaseCoords,
+          showMapModal,
+        })
+
+        // Debounce geocoding to prevent rapid successive calls
+        const timeoutId = setTimeout(() => {
+          ensurePickupDropCoordinates()
+        }, 500) // 500ms debounce
+
+        return () => clearTimeout(timeoutId)
+      }
+    }
+  }, [ensurePickupDropCoordinates, tripData, showMapModal])
+
   const getAssignedCab = async (): Promise<void> => {
     try {
       setLoading(true)
       const token = await AsyncStorage.getItem("userToken")
 
       if (token) {
-        const cabResponse = await axios.get("https://api.routebudget.com/api/assignCab/driver", {
+        const cabResponse = await axios.get(`${API_BASE_URL}/api/assignCab/driver`, {
           headers: { Authorization: `Bearer ${token}` },
         })
 
         if (cabResponse.data && cabResponse.data.length > 0) {
           setCabNumber(cabResponse.data[0].CabsDetail.cabNumber || "")
+          if (cabResponse.data[0].driverId) {
+            setDriverId(cabResponse.data[0].driverId.toString())
+          }
         }
 
-        const tripResponse = await axios.get("https://api.routebudget.com/api/assignCab/driver/getassgnedcab", {
+        const tripResponse = await axios.get(`${API_BASE_URL}/api/assignCab/driver/getassgnedcab`, {
           headers: { Authorization: `Bearer ${token}` },
         })
 
@@ -551,6 +512,11 @@ const CustomerDetailScreen: React.FC<CustomerDetailScreenProps> = ({ onClose }) 
 
         if (tripResponse.data && tripResponse.data.assignment && tripResponse.data.assignment.length > 0) {
           const assignmentData = tripResponse.data.assignment[0]
+
+          const pickupLatitude = assignmentData.pickupLatitude ?? assignmentData.CabAssignment?.pickupLatitude ?? null
+          const pickupLongitude = assignmentData.pickupLongitude ?? assignmentData.CabAssignment?.pickupLongitude ?? null
+          const dropLatitude = assignmentData.dropLatitude ?? assignmentData.CabAssignment?.dropLatitude ?? null
+          const dropLongitude = assignmentData.dropLongitude ?? assignmentData.CabAssignment?.dropLongitude ?? null
 
           setTripData({
             customerName: assignmentData.customerName,
@@ -568,7 +534,31 @@ const CustomerDetailScreen: React.FC<CustomerDetailScreenProps> = ({ onClose }) 
             dropTime: assignmentData.dropTime,
             specialInstructions: assignmentData.specialInstructions,
             adminNotes: assignmentData.adminNotes,
+            id: assignmentData.id ?? assignmentData.CabAssignmentId ?? null,
+            driverId: assignmentData.driverId ?? assignmentData.DriverId ?? null,
+            pickupLatitude,
+            pickupLongitude,
+            dropLatitude,
+            dropLongitude,
           })
+
+          if (pickupLatitude && pickupLongitude) {
+            const pickup: LocationCoords = {
+              latitude: Number(pickupLatitude),
+              longitude: Number(pickupLongitude),
+            }
+            setPickupCoords(pickup)
+            console.log("Assigned pickup coords from API", pickup)
+            // WebSocket will connect automatically when database coordinates are available
+
+            const drop: LocationCoords = {
+              latitude: Number(dropLatitude),
+              longitude: Number(dropLongitude),
+            }
+            setDropCoords(drop)
+            console.log("Assigned drop coords from API", drop)
+            // WebSocket will connect automatically when database coordinates are available
+          }
         }
       }
     } catch (error) {
@@ -579,24 +569,8 @@ const CustomerDetailScreen: React.FC<CustomerDetailScreenProps> = ({ onClose }) 
     }
   }
 
-  const formatDateTime = (dateString: string | null): string => {
-    if (!dateString) return "Not set"
-    try {
-      const date = new Date(dateString)
-      return date.toLocaleString()
-    } catch {
-      return "Invalid date"
-    }
-  }
-
-  const formatCurrency = (amount: number | null): string => {
-    if (amount === null || amount === undefined) return "Not set"
-    return `₹${amount.toFixed(2)}`
-  }
-
   const getMapRegion = () => {
     if (mapMode === "toPickup" && currentLocation && pickupCoords) {
-      // Center between current location and pickup with appropriate zoom
       const midLat = (currentLocation.latitude + pickupCoords.latitude) / 2
       const midLng = (currentLocation.longitude + pickupCoords.longitude) / 2
       const latDelta = Math.abs(currentLocation.latitude - pickupCoords.latitude) * 1.5
@@ -605,11 +579,10 @@ const CustomerDetailScreen: React.FC<CustomerDetailScreenProps> = ({ onClose }) 
       return {
         latitude: midLat,
         longitude: midLng,
-        latitudeDelta: Math.max(latDelta, 0.01), // Minimum zoom level
+        latitudeDelta: Math.max(latDelta, 0.01),
         longitudeDelta: Math.max(lngDelta, 0.01),
       }
     } else if (mapMode === "toPickup" && currentLocation) {
-      // Center on current location with close zoom
       return {
         latitude: currentLocation.latitude,
         longitude: currentLocation.longitude,
@@ -617,7 +590,6 @@ const CustomerDetailScreen: React.FC<CustomerDetailScreenProps> = ({ onClose }) 
         longitudeDelta: 0.004,
       }
     } else if (pickupCoords && dropCoords) {
-      // Center between pickup and drop
       const midLat = (pickupCoords.latitude + dropCoords.latitude) / 2
       const midLng = (pickupCoords.longitude + dropCoords.longitude) / 2
       const latDelta = Math.abs(pickupCoords.latitude - dropCoords.latitude) * 1.3
@@ -638,7 +610,15 @@ const CustomerDetailScreen: React.FC<CustomerDetailScreenProps> = ({ onClose }) 
       }
     }
 
-    // Default region (Mumbai area)
+    if (currentLocation) {
+      return {
+        latitude: currentLocation.latitude,
+        longitude: currentLocation.longitude,
+        latitudeDelta: 0.05,
+        longitudeDelta: 0.05,
+      }
+    }
+
     return {
       latitude: 19.076,
       longitude: 72.8777,
@@ -647,11 +627,298 @@ const CustomerDetailScreen: React.FC<CustomerDetailScreenProps> = ({ onClose }) 
     }
   }
 
-  const handlePhonePress = () => {
-    if (tripData?.customerPhone) {
-      Linking.openURL(`tel:${tripData.customerPhone}`)
+  const loadViewerIdentifier = useCallback(async () => {
+    try {
+      const storedViewer = await AsyncStorage.getItem("viewerId")
+      if (storedViewer) {
+        setViewerId(storedViewer)
+        return
+      }
+
+      const baseUser = (await AsyncStorage.getItem("userid")) ?? `viewer-${Date.now()}`
+      const viewerIdentifier = `viewer-${baseUser}`
+      await AsyncStorage.setItem("viewerId", viewerIdentifier)
+      setViewerId(viewerIdentifier)
+    } catch (error) {
+      console.log("Error loading viewer identifier:", error)
     }
-  }
+  }, [])
+
+  const cleanupSocket = useCallback(() => {
+    // Clear any pending reconnection
+    if (reconnectTimeoutRef.current.timeout) {
+      clearTimeout(reconnectTimeoutRef.current.timeout)
+      reconnectTimeoutRef.current.timeout = null
+    }
+
+    // Close existing WebSocket connection
+    if (websocketRef.current) {
+      // Remove event listeners to prevent memory leaks
+      websocketRef.current.onclose = null
+      websocketRef.current.onerror = null
+      websocketRef.current.onmessage = null
+
+      // Close if still open or connecting
+      if (websocketRef.current.readyState === WebSocket.OPEN ||
+          websocketRef.current.readyState === WebSocket.CONNECTING) {
+        websocketRef.current.close(1000, "Component cleanup")
+      }
+      websocketRef.current = null
+    }
+
+    setIsSocketConnected(false)
+  }, [])
+
+  const handleDriverUpdate = useCallback(
+    async (payload: {
+      location: {
+        latitude: number
+        longitude: number
+        pickup?: LocationCoords | null
+        drop?: LocationCoords | null
+        phase?: TripPhase
+      }
+    }) => {
+      try {
+        const { location } = payload
+        const driverPoint: LocationCoords = {
+          latitude: Number(location.latitude),
+          longitude: Number(location.longitude),
+        }
+
+        setCurrentLocation(driverPoint)
+
+        if (location.pickup?.latitude && location.pickup?.longitude) {
+          setPickupCoords({
+            latitude: Number(location.pickup.latitude),
+            longitude: Number(location.pickup.longitude),
+          })
+        }
+
+        if (location.drop?.latitude && location.drop?.longitude) {
+          setDropCoords({
+            latitude: Number(location.drop.latitude),
+            longitude: Number(location.drop.longitude),
+          })
+        }
+
+        if (location.phase) {
+          setTripPhase(location.phase)
+        }
+
+        if (!pendingRouteRef.current) {
+          if (location.phase === "to_pickup" && location.pickup) {
+            pendingRouteRef.current = {
+              origin: driverPoint,
+              destination: {
+                latitude: Number(location.pickup.latitude),
+                longitude: Number(location.pickup.longitude),
+              },
+            }
+          } else if (location.phase === "to_drop" && location.drop) {
+            pendingRouteRef.current = {
+              origin: driverPoint,
+              destination: {
+                latitude: Number(location.drop.latitude),
+                longitude: Number(location.drop.longitude),
+              },
+            }
+          }
+        } else {
+          pendingRouteRef.current = {
+            origin: driverPoint,
+            destination: pendingRouteRef.current.destination,
+          }
+        }
+
+        if (pendingRouteRef.current) {
+          const directions = await getDirections(
+            pendingRouteRef.current.origin,
+            pendingRouteRef.current.destination,
+          )
+          setPolylineCoords(directions)
+        }
+      } catch (error) {
+        console.log("Error handling driver update:", error)
+      }
+    },
+    [getDirections],
+  )
+
+  const connectSocket = useCallback(() => {
+    console.log("🚀 connectSocket called with:", {
+      viewerId: !!viewerId,
+      driverId: !!driverId,
+      currentConnection: websocketRef.current?.readyState,
+      isSocketConnected,
+    })
+
+    if (!viewerId || !driverId) {
+      console.log("❌ connectSocket: Missing viewerId or driverId")
+      return
+    }
+
+    // Prevent multiple simultaneous connection attempts
+    if (websocketRef.current && websocketRef.current.readyState === WebSocket.CONNECTING) {
+      console.log("WebSocket already connecting, skipping...")
+      return
+    }
+
+    // Don't connect if already connected and working
+    if (websocketRef.current && websocketRef.current.readyState === WebSocket.OPEN && isSocketConnected) {
+      console.log("WebSocket already connected and working, skipping...")
+      return
+    }
+
+    cleanupSocket()
+
+    console.log("Attempting WebSocket connection to:", WS_BASE_URL)
+    const ws = new WebSocket(WS_BASE_URL)
+    websocketRef.current = ws
+
+    ws.onopen = () => {
+      console.log("✅ WebSocket connected successfully to", WS_BASE_URL)
+      setIsSocketConnected(true)
+      ws.send(
+        JSON.stringify({
+          type: "register",
+          role: "viewer",
+          viewerId,
+          trackDriverId: driverId,
+        }),
+      )
+    }
+
+    ws.onmessage = (event) => {
+      try {
+        console.log("📨 Customer received raw message:", event.data);
+        const data = JSON.parse(event.data);
+        console.log("📨 Customer parsed message:", data);
+
+        if (data.type === "location_update" && data.location) {
+          console.log("📍 Processing location update:", data);
+          handleDriverUpdate(data);
+        } else if (data.type === "register_confirmation") {
+          console.log("✅ Customer registration confirmed:", data.message);
+        } else {
+          console.log("❓ Unknown message type:", data.type);
+        }
+      } catch (error) {
+        console.log("❌ Error parsing customer websocket message:", error);
+      }
+    }
+
+    ws.onclose = (event) => {
+      console.log("WebSocket closed:", event.code, event.reason)
+      setIsSocketConnected(false)
+
+      // Only reconnect if we have valid IDs and connection wasn't closed intentionally
+      if (!viewerId || !driverId || event.code === 1000) {
+        console.log("WebSocket closed intentionally or missing IDs, not reconnecting")
+        return
+      }
+
+      // Exponential backoff with max retry attempts
+      const retryCount = reconnectTimeoutRef.current.retryCount
+      const delay = Math.min(1000 * Math.pow(2, retryCount), 30000) // Max 30 seconds
+
+      console.log(`Scheduling reconnection attempt ${retryCount + 1} in ${delay}ms`)
+
+      reconnectTimeoutRef.current.timeout = setTimeout(() => {
+        reconnectTimeoutRef.current.timeout = null
+        if (retryCount < 10) { // Max 10 retry attempts
+          reconnectTimeoutRef.current.retryCount = retryCount + 1
+          connectSocket()
+        } else {
+          console.log("Max reconnection attempts reached")
+        }
+      }, delay)
+    }
+
+    ws.onerror = (error) => {
+      console.log("WebSocket error:", error)
+    }
+  }, [cleanupSocket, driverId, handleDriverUpdate, viewerId, isSocketConnected])
+
+  useEffect(() => {
+    console.log("WebSocket connection check:", {
+      viewerId: !!viewerId,
+      driverId: !!driverId,
+      hasDatabaseCoords: tripData?.pickupLatitude && tripData?.dropLatitude,
+      userRequestedTracking: showMapModal,
+      tripDataCoords: {
+        pickupLatitude: tripData?.pickupLatitude,
+        dropLatitude: tripData?.dropLatitude,
+      },
+      shouldConnect: viewerId && driverId && ((tripData?.pickupLatitude && tripData?.dropLatitude) || showMapModal),
+    })
+
+    // Connect WebSocket when:
+    // 1. We have database coordinates (driver submitted coordinates), OR
+    // 2. User explicitly opened the map modal (wants to track)
+    const hasDatabaseCoords = tripData?.pickupLatitude && tripData?.dropLatitude
+    const userRequestedTracking = showMapModal
+
+    if (viewerId && driverId && (hasDatabaseCoords || userRequestedTracking)) {
+      console.log("🔗 Connecting WebSocket due to:", {
+        hasDatabaseCoords,
+        userRequestedTracking,
+      })
+      connectSocket()
+    }
+
+    return () => {
+      cleanupSocket()
+    }
+  }, [cleanupSocket, connectSocket, driverId, viewerId, tripData?.pickupLatitude, tripData?.dropLatitude, showMapModal])
+
+  useEffect(() => {
+    if (mapRef.current && currentLocation && mapMode === "toPickup") {
+      mapRef.current.animateToRegion(
+        {
+          latitude: currentLocation.latitude,
+          longitude: currentLocation.longitude,
+          latitudeDelta: 0.01,
+          longitudeDelta: 0.01,
+        },
+        750,
+      )
+    }
+  }, [currentLocation, mapMode])
+
+  useEffect(() => {
+    if (mapRef.current && pickupCoords && dropCoords && mapMode === "full") {
+      const midLat = (pickupCoords.latitude + dropCoords.latitude) / 2
+      const midLng = (pickupCoords.longitude + dropCoords.longitude) / 2
+      const latDelta = Math.abs(pickupCoords.latitude - dropCoords.latitude) * 1.3 || 0.08
+      const lngDelta = Math.abs(pickupCoords.longitude - dropCoords.longitude) * 1.3 || 0.08
+
+      mapRef.current.animateToRegion(
+        {
+          latitude: midLat,
+          longitude: midLng,
+          latitudeDelta: Math.max(latDelta, 0.02),
+          longitudeDelta: Math.max(lngDelta, 0.02),
+        },
+        750,
+      )
+    }
+  }, [dropCoords, mapMode, pickupCoords])
+
+  const tripPhaseLabel = useMemo(() => {
+    switch (tripPhase) {
+      case "to_pickup":
+        return "Driver en route to pickup"
+      case "pickup_reached":
+        return "Driver at pickup point"
+      case "to_drop":
+        return "Driver en route to drop"
+      case "completed":
+        return "Trip completed"
+      default:
+        return isSocketConnected ? "Live tracking active" : "Connecting to driver"
+    }
+  }, [isSocketConnected, tripPhase])
 
   if (loading) {
     return (
@@ -672,38 +939,6 @@ const CustomerDetailScreen: React.FC<CustomerDetailScreenProps> = ({ onClose }) 
           bounces={true}
           scrollEventThrottle={16}
         >
-          {/* Customer Information Card */}
-          <View style={styles.card}>
-            <View style={styles.cardHeader}>
-              <MaterialIcons name="person" size={18} color="#F59E0B" />
-              <Text style={styles.cardTitle}>Customer Information</Text>
-            </View>
-
-            <View style={styles.infoRow}>
-              <View style={styles.infoItem}>
-                <MaterialIcons name="person-outline" size={16} color="#92400E" />
-                <View style={styles.infoContent}>
-                  <Text style={styles.infoLabel}>Customer Name</Text>
-                  <Text style={styles.infoValue}>{tripData?.customerName || "Not provided"}</Text>
-                </View>
-              </View>
-            </View>
-
-            <View style={styles.infoRow}>
-              <View style={styles.infoItem}>
-                <MaterialIcons name="phone" size={16} color="#92400E" />
-                <View style={styles.infoContent}>
-                  <Text style={styles.infoLabel}>Phone Number</Text>
-                  <TouchableOpacity onPress={handlePhonePress} disabled={!tripData?.customerPhone}>
-                    <Text style={[styles.infoValue, tripData?.customerPhone && styles.phoneNumber]}>
-                      {tripData?.customerPhone || "Not provided"}
-                    </Text>
-                  </TouchableOpacity>
-                </View>
-              </View>
-            </View>
-          </View>
-
           {/* Trip Details Card */}
           <View style={styles.card}>
             <View style={styles.cardHeader}>
@@ -772,76 +1007,180 @@ const CustomerDetailScreen: React.FC<CustomerDetailScreenProps> = ({ onClose }) 
             </View>
           </View>
 
-          {/* Timing Information Card */}
-          <View style={styles.card}>
-            <View style={styles.cardHeader}>
-              <MaterialIcons name="access-time" size={18} color="#F59E0B" />
-              <Text style={styles.cardTitle}>Timing Information</Text>
-            </View>
+          {/* Coordinate Debug Display */}
+          {(tripData?.pickupLocation || tripData?.dropLocation || pickupCoords || dropCoords || currentLocation) && (
+            <View style={styles.debugCard}>
+              <View style={styles.cardHeader}>
+                <MaterialIcons name="location-searching" size={18} color="#F59E0B" />
+                <Text style={styles.cardTitle}>📍 Live Tracking Debug</Text>
+              </View>
 
-            <View style={styles.infoRow}>
-              <View style={styles.infoItem}>
-                <MaterialIcons name="event" size={16} color="#92400E" />
-                <View style={styles.infoContent}>
-                  <Text style={styles.infoLabel}>Scheduled Pickup</Text>
-                  <Text style={styles.infoValue}>{formatDateTime(tripData?.scheduledPickupTime)}</Text>
+              {/* Connection Status */}
+              <View style={styles.debugRow}>
+                <Text style={styles.debugLabel}>WebSocket Status:</Text>
+                <Text style={[styles.debugValue, { color: isSocketConnected ? "#10b981" : "#ef4444" }]}>
+                  {(() => {
+                    const wsState = websocketRef.current?.readyState
+                    if (wsState === WebSocket.CONNECTING) return "🟡 Connecting..."
+                    if (wsState === WebSocket.OPEN && isSocketConnected) return "🟢 Connected"
+                    if (wsState === WebSocket.CLOSED) return "🔴 Disconnected"
+                    if (wsState === WebSocket.CLOSING) return "🟠 Closing..."
+                    return "⚫ Unknown"
+                  })()}
+                </Text>
+              </View>
+
+              {/* Connection Details */}
+              <View style={styles.debugRow}>
+                <Text style={styles.debugLabel}>Connection State:</Text>
+                <Text style={styles.debugValue}>
+                  {websocketRef.current
+                    ? websocketRef.current.readyState === WebSocket.CONNECTING
+                      ? "CONNECTING"
+                      : websocketRef.current.readyState === WebSocket.OPEN
+                      ? "OPEN"
+                      : websocketRef.current.readyState === WebSocket.CLOSING
+                      ? "CLOSING"
+                      : "CLOSED"
+                    : "NO_CONNECTION"}
+                </Text>
+              </View>
+
+              {/* Reconnection Info */}
+              <View style={styles.debugRow}>
+                <Text style={styles.debugLabel}>Retry Count:</Text>
+                <Text style={styles.debugValue}>
+                  {reconnectTimeoutRef.current.retryCount}
+                </Text>
+              </View>
+
+              {/* Trip Phase */}
+              <View style={styles.debugRow}>
+                <Text style={styles.debugLabel}>Trip Phase:</Text>
+                <Text style={styles.debugValue}>{tripPhaseLabel}</Text>
+              </View>
+
+              {/* Database Coordinates */}
+              {tripData && (
+                <>
+                  <View style={styles.debugRow}>
+                    <Text style={styles.debugLabel}>Pickup (DB):</Text>
+                    <Text style={styles.debugValue}>
+                      {tripData.pickupLatitude && tripData.pickupLongitude
+                        ? `${tripData.pickupLatitude.toFixed(6)}, ${tripData.pickupLongitude.toFixed(6)}`
+                        : "❌ Waiting for driver to submit coordinates"}
+                    </Text>
+                  </View>
+
+                  <View style={styles.debugRow}>
+                    <Text style={styles.debugLabel}>Drop (DB):</Text>
+                    <Text style={styles.debugValue}>
+                      {tripData.dropLatitude && tripData.dropLongitude
+                        ? `${tripData.dropLatitude.toFixed(6)}, ${tripData.dropLongitude.toFixed(6)}`
+                        : "❌ Waiting for driver to submit coordinates"}
+                    </Text>
+                  </View>
+                </>
+              )}
+
+              {/* Resolved Coordinates */}
+              {pickupCoords && (
+                <View style={styles.debugRow}>
+                  <Text style={styles.debugLabel}>Pickup (Map):</Text>
+                  <Text style={styles.debugValue}>
+                    {pickupCoords.latitude.toFixed(6)}, {pickupCoords.longitude.toFixed(6)}
+                  </Text>
                 </View>
+              )}
+
+              {dropCoords && (
+                <View style={styles.debugRow}>
+                  <Text style={styles.debugLabel}>Drop (Map):</Text>
+                  <Text style={styles.debugValue}>
+                    {dropCoords.latitude.toFixed(6)}, {dropCoords.longitude.toFixed(6)}
+                  </Text>
+                </View>
+              )}
+
+              {/* Current Driver Location */}
+              {currentLocation && (
+                <View style={styles.debugRow}>
+                  <Text style={styles.debugLabel}>Driver Location:</Text>
+                  <Text style={styles.debugValue}>
+                    {currentLocation.latitude.toFixed(6)}, {currentLocation.longitude.toFixed(6)}
+                  </Text>
+                </View>
+              )}
+
+              {/* Map Mode */}
+              <View style={styles.debugRow}>
+                <Text style={styles.debugLabel}>Map Mode:</Text>
+                <Text style={styles.debugValue}>{mapMode}</Text>
+              </View>
+
+              {/* Polyline Points */}
+              <View style={styles.debugRow}>
+                <Text style={styles.debugLabel}>Route Points:</Text>
+                <Text style={styles.debugValue}>{polylineCoords.length}</Text>
+              </View>
+
+              {/* Manual Reconnect Button */}
+              <View style={styles.debugActionRow}>
+                <TouchableOpacity
+                  style={styles.reconnectButton}
+                  onPress={() => {
+                    console.log("Manual reconnect triggered")
+                    reconnectTimeoutRef.current.retryCount = 0 // Reset retry count
+                    connectSocket()
+                  }}
+                  activeOpacity={0.7}
+                >
+                  <MaterialIcons name="refresh" size={16} color="#F59E0B" />
+                  <Text style={styles.reconnectText}>Reconnect</Text>
+                </TouchableOpacity>
+
+                <TouchableOpacity
+                  style={styles.refreshButton}
+                  onPress={() => {
+                    console.log("Manual refresh triggered")
+                    getAssignedCab()
+                  }}
+                  activeOpacity={0.7}
+                >
+                  <MaterialIcons name="sync" size={16} color="#10b981" />
+                  <Text style={styles.refreshText}>Refresh</Text>
+                </TouchableOpacity>
               </View>
             </View>
+          )}
 
-            <View style={styles.infoRow}>
-              <View style={styles.infoItem}>
-                <MaterialIcons name="play-circle-outline" size={16} color="#10b981" />
-                <View style={styles.infoContent}>
-                  <Text style={styles.infoLabel}>Actual Pickup</Text>
-                  <Text style={styles.infoValue}>{formatDateTime(tripData?.actualPickupTime)}</Text>
-                </View>
+          {/* Coordinate Status Information */}
+          {tripData && (!tripData.pickupLatitude || !tripData.dropLatitude) && (
+            <View style={styles.infoCard}>
+              <View style={styles.cardHeader}>
+                <MaterialIcons name="info-outline" size={18} color="#F59E0B" />
+                <Text style={styles.cardTitle}>Coordinate Status</Text>
               </View>
-            </View>
-
-            <View style={styles.infoRow}>
-              <View style={styles.infoItem}>
-                <MaterialIcons name="stop-circle" size={16} color="#ef4444" />
+              <View style={styles.infoRow}>
+                <MaterialIcons name="schedule" size={16} color="#F59E0B" />
                 <View style={styles.infoContent}>
-                  <Text style={styles.infoLabel}>Drop Time</Text>
-                  <Text style={styles.infoValue}>{formatDateTime(tripData?.dropTime)}</Text>
-                </View>
-              </View>
-            </View>
-          </View>
-
-          {/* Fare Information Card */}
-          <View style={styles.card}>
-            <View style={styles.cardHeader}>
-              <MaterialIcons name="payments" size={18} color="#F59E0B" />
-              <Text style={styles.cardTitle}>Fare Information</Text>
-            </View>
-
-            <View style={styles.infoRow}>
-              <View style={styles.infoItem}>
-                <MaterialIcons name="calculate" size={16} color="#92400E" />
-                <View style={styles.infoContent}>
-                  <Text style={styles.infoLabel}>Estimated Fare</Text>
-                  <Text style={styles.infoValue}>{formatCurrency(tripData?.estimatedFare)}</Text>
-                </View>
-              </View>
-            </View>
-
-            <View style={styles.infoRow}>
-              <View style={styles.infoItem}>
-                <MaterialIcons name="receipt" size={16} color="#10b981" />
-                <View style={styles.infoContent}>
-                  <Text style={[styles.infoValue, tripData?.actualFare && styles.fareAmount]}>
-                    {formatCurrency(tripData?.actualFare)}
+                  <Text style={styles.infoValue}>
+                    Driver needs to submit pickup and drop coordinates before live tracking can begin.
+                    Please wait for the driver to complete their location submission.
                   </Text>
                 </View>
               </View>
+              <TouchableOpacity
+                style={styles.refreshButton}
+                onPress={getAssignedCab}
+                activeOpacity={0.8}
+              >
+                <MaterialIcons name="refresh" size={16} color="#ffffff" />
+                <Text style={styles.refreshButtonText}>Check for Updates</Text>
+              </TouchableOpacity>
             </View>
-          </View>
-
-          {/* Additional Information Card */}
-          {(tripData?.specialInstructions || tripData?.adminNotes) && (
-            <View style={styles.card}>
+          )}
+          <View style={styles.card}>
               <View style={styles.cardHeader}>
                 <MaterialIcons name="info" size={18} color="#F59E0B" />
                 <Text style={styles.cardTitle}>Additional Information</Text>
@@ -871,15 +1210,15 @@ const CustomerDetailScreen: React.FC<CustomerDetailScreenProps> = ({ onClose }) 
                 </View>
               )}
             </View>
-          )}
+          
 
           {/* No Trip Data Message */}
-          {!tripData?.customerName && !tripData?.pickupLocation && (
+          {!tripData?.pickupLocation && (
             <View style={styles.noDataCard}>
               <MaterialIcons name="info-outline" size={24} color="#92400E" />
               <Text style={styles.noDataTitle}>No Active Trip</Text>
               <Text style={styles.noDataText}>
-                No customer trip details are currently available. Trip information will appear here once a ride is
+                No trip details are currently available. Trip information will appear here once a ride is
                 assigned.
               </Text>
             </View>
@@ -904,19 +1243,17 @@ const CustomerDetailScreen: React.FC<CustomerDetailScreenProps> = ({ onClose }) 
         visible={showMapModal}
         animationType="slide"
         transparent={false}
-        onRequestClose={() => setShowMapModal(false)}
+        onRequestClose={closeMapModal}
       >
         <View style={styles.mapContainer}>
-          {/* Map Header */}
           <View style={styles.mapHeader}>
-            <TouchableOpacity style={styles.closeButton} onPress={() => setShowMapModal(false)}>
+            <TouchableOpacity style={styles.closeButton} onPress={closeMapModal}>
               <MaterialIcons name="close" size={24} color="#1f2937" />
             </TouchableOpacity>
             <Text style={styles.mapHeaderTitle}>Trip Route</Text>
             <View style={styles.headerSpacer} />
           </View>
 
-          {/* Map Loading */}
           {mapLoading && (
             <View style={styles.mapLoadingOverlay}>
               <ActivityIndicator size="large" color="#F59E0B" />
@@ -924,7 +1261,6 @@ const CustomerDetailScreen: React.FC<CustomerDetailScreenProps> = ({ onClose }) 
             </View>
           )}
 
-          {/* Map View */}
           <MapView
             ref={mapRef}
             provider={PROVIDER_GOOGLE}
@@ -1007,7 +1343,6 @@ const CustomerDetailScreen: React.FC<CustomerDetailScreenProps> = ({ onClose }) 
               </Marker>
             )}
 
-            {/* Pickup Marker */}
             {pickupCoords && (
               <Marker
                 coordinate={pickupCoords}
@@ -1021,7 +1356,6 @@ const CustomerDetailScreen: React.FC<CustomerDetailScreenProps> = ({ onClose }) 
               </Marker>
             )}
 
-            {/* Drop Marker - Only show in full and pickupToDrop modes */}
             {(mapMode === "full" || mapMode === "pickupToDrop") && dropCoords && (
               <Marker
                 coordinate={dropCoords}
@@ -1035,7 +1369,6 @@ const CustomerDetailScreen: React.FC<CustomerDetailScreenProps> = ({ onClose }) 
               </Marker>
             )}
 
-            {/* Route Polyline */}
             {polylineCoords.length > 0 && (
               <Polyline
                 coordinates={polylineCoords}
@@ -1048,7 +1381,6 @@ const CustomerDetailScreen: React.FC<CustomerDetailScreenProps> = ({ onClose }) 
             )}
           </MapView>
 
-          {/* Map Control Buttons */}
           <View style={styles.mapControlsContainer}>
             <TouchableOpacity
               style={[styles.mapControlButton, mapMode === "toPickup" && styles.activeMapControlButton]}
@@ -1073,7 +1405,6 @@ const CustomerDetailScreen: React.FC<CustomerDetailScreenProps> = ({ onClose }) 
             </TouchableOpacity>
           </View>
 
-          {/* Trip Info Overlay */}
           <View style={styles.tripInfoOverlay}>
             <View style={styles.tripInfoCard}>
               {mapMode === "toPickup" && (
@@ -1140,7 +1471,7 @@ const CustomerDetailScreen: React.FC<CustomerDetailScreenProps> = ({ onClose }) 
 const styles = StyleSheet.create({
   container: {
     flex: 1,
-    backgroundColor: "#FFFBEB", // Light yellow background
+    backgroundColor: "#FFFBEB",
   },
   contentContainer: {
     flex: 1,
@@ -1219,11 +1550,6 @@ const styles = StyleSheet.create({
     color: "#1f2937",
     lineHeight: 20,
   },
-  fareAmount: {
-    color: "#10b981",
-    fontWeight: "700",
-    fontSize: 16,
-  },
   noDataCard: {
     backgroundColor: "#ffffff",
     borderRadius: 16,
@@ -1252,7 +1578,6 @@ const styles = StyleSheet.create({
     lineHeight: 20,
     opacity: 0.8,
   },
-  // Fixed Button Styles
   fixedButtonContainer: {
     position: "absolute",
     bottom: 0,
@@ -1289,7 +1614,6 @@ const styles = StyleSheet.create({
     fontWeight: "700",
     marginLeft: 8,
   },
-  // Map Modal Styles
   mapContainer: {
     flex: 1,
     backgroundColor: "#ffffff",
@@ -1472,9 +1796,113 @@ const styles = StyleSheet.create({
     marginHorizontal: 8,
     marginVertical: 4,
   },
-  phoneNumber: {
-    color: "#2563EB", // Added blue color to indicate clickable phone number
-    textDecorationLine: "underline",
+  debugCard: {
+    backgroundColor: "#FFF3E0",
+    borderRadius: 16,
+    padding: 20,
+    marginBottom: 16,
+    shadowColor: "#F59E0B",
+    shadowOffset: { width: 0, height: 4 },
+    shadowOpacity: 0.1,
+    shadowRadius: 8,
+    elevation: 4,
+    borderWidth: 2,
+    borderColor: "#FFE0B2",
+  },
+  debugRow: {
+    flexDirection: "row",
+    justifyContent: "space-between",
+    alignItems: "center",
+    paddingVertical: 6,
+    borderBottomWidth: StyleSheet.hairlineWidth,
+    borderBottomColor: "#FFE0B2",
+  },
+  debugLabel: {
+    fontSize: 12,
+    fontWeight: "600",
+    color: "#BF360C",
+    flex: 1,
+  },
+  debugValue: {
+    fontSize: 12,
+    fontWeight: "600",
+    color: "#3E2723",
+    textAlign: "right",
+    flex: 1,
+  },
+  debugActionRow: {
+    flexDirection: "row",
+    justifyContent: "space-between",
+    alignItems: "center",
+    paddingVertical: 8,
+    marginTop: 8,
+    paddingTop: 12,
+    borderTopWidth: 1,
+    borderTopColor: "#FFE0B2",
+  },
+  debugActionLabel: {
+    fontSize: 13,
+    fontWeight: "700",
+    color: "#E65100",
+  },
+  debugActionValue: {
+    fontSize: 12,
+    fontWeight: "600",
+    color: "#2E7D32",
+    textAlign: "right",
+    flex: 1,
+  },
+  reconnectButton: {
+    flexDirection: "row",
+    alignItems: "center",
+    backgroundColor: "#FEF3C7",
+    paddingHorizontal: 12,
+    paddingVertical: 6,
+    borderRadius: 16,
+    borderWidth: 1,
+    borderColor: "#F59E0B",
+  },
+  reconnectText: {
+    fontSize: 12,
+    fontWeight: "600",
+    color: "#F59E0B",
+    marginLeft: 4,
+  },
+  refreshButton: {
+    flexDirection: "row",
+    alignItems: "center",
+    backgroundColor: "#10b981",
+    paddingHorizontal: 12,
+    paddingVertical: 6,
+    borderRadius: 16,
+    borderWidth: 1,
+    borderColor: "#10b981",
+    marginLeft: 8,
+  },
+  refreshText: {
+    fontSize: 12,
+    fontWeight: "600",
+    color: "#10b981",
+    marginLeft: 4,
+  },
+  infoCard: {
+    backgroundColor: "#E8F5E9",
+    borderRadius: 16,
+    padding: 20,
+    marginBottom: 16,
+    shadowColor: "#10b981",
+    shadowOffset: { width: 0, height: 4 },
+    shadowOpacity: 0.1,
+    shadowRadius: 8,
+    elevation: 4,
+    borderWidth: 1,
+    borderColor: "#C8E6C9",
+  },
+  refreshButtonText: {
+    color: "#ffffff",
+    fontSize: 12,
+    fontWeight: "600",
+    marginLeft: 4,
   },
 })
 

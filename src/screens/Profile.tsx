@@ -38,7 +38,7 @@ const Profile = ({navigation}) => {
       const userId = await AsyncStorage.getItem("userid");
   
       if (token) {
-        const response = await axios.get("https://api.routebudget.com/api/cabDetails/driver", {
+        const response = await axios.get("http://192.168.1.5:5000/api/cabDetails/driver", {
           headers: {
             Authorization: `Bearer ${token}`
           }

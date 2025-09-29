@@ -68,7 +68,7 @@ const VehicleServiceScreen: React.FC<VehicleServiceScreenProps> = ({ navigation 
     try {
       setLoading(true);
       const axiosInstance = axios.create({
-        baseURL: "https://api.routebudget.com/api",
+        baseURL: "http://192.168.1.5:5000/api",
         timeout: 5000,
         headers: { Authorization: `Bearer ${token}` }
       });
@@ -247,7 +247,7 @@ const VehicleServiceScreen: React.FC<VehicleServiceScreenProps> = ({ navigation 
 
       // Create axios instance with proper multipart headers
       const axiosInstance = axios.create({
-        baseURL: "https://api.routebudget.com/api",
+        baseURL: "http://192.168.1.5:5000/api",
         timeout: 15000,
         headers: {
           "Content-Type": "multipart/form-data",

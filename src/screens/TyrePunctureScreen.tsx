@@ -891,7 +891,7 @@ const TyrePunctureScreen: React.FC<TyrePunctureScreenProps> = ({ onClose }) => {
 
       if (token) {
         const response = await axios.get(
-          "https://api.routebudget.com/api/assignCab/driver",
+          "http://192.168.1.5:5000/api/assignCab/driver",
           {
             headers: { Authorization: `Bearer ${token}` },
           }
@@ -1058,7 +1058,7 @@ const TyrePunctureScreen: React.FC<TyrePunctureScreenProps> = ({ onClose }) => {
       };
 
       const response = await axios.patch(
-        "https://api.routebudget.com/api/assigncab/update-trip",
+        "http://192.168.1.5:5000/api/assigncab/update-trip",
         formData,
         uploadConfig
       );

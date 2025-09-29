@@ -4,7 +4,7 @@ import { useNavigation, useRoute, useFocusEffect } from '@react-navigation/nativ
 import Ionicons from 'react-native-vector-icons/Ionicons';
 
 const Footer = () => {
-  const navigation = useNavigation();
+  const navigation = useNavigation<any>();
   const route = useRoute(); // Get the current screen name
   const [activeTab, setActiveTab] = useState(route.name);
 
@@ -14,8 +14,8 @@ const Footer = () => {
     }, [route.name])
   );
 
-  const handlePress = (tabName) => {
-    navigation.navigate(tabName);
+  const handlePress = (tabName: string) => {
+    navigation.navigate(tabName as never);
   };
 
   return (
@@ -30,6 +30,12 @@ const Footer = () => {
       <TouchableOpacity onPress={() => handlePress("AssignCab")} style={styles.box}>
         <Ionicons name="car" size={28} color={activeTab === "AssignCab" ? "#F8C146" : "#B2D6EF"} />
         <Text style={[styles.text, activeTab === "AssignCab" && styles.activeText]}>Assign Cab</Text>
+      </TouchableOpacity>
+
+      {/* History */}
+      <TouchableOpacity onPress={() => handlePress("History")} style={styles.box}>
+        <Ionicons name="time-outline" size={28} color={activeTab === "History" ? "#F8C146" : "#B2D6EF"} />
+        <Text style={[styles.text, activeTab === "History" && styles.activeText]}>History</Text>
       </TouchableOpacity>
     </View>
   );
