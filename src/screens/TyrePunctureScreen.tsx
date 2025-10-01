@@ -66,7 +66,7 @@
 //   const fetchCabDetails = async (token: string) => {
 //     try {
 //       const axiosInstance = axios.create({
-//         baseURL: "http://192.168.1.47:5000/api",
+//         baseURL: "http://192.168.1.25:5000/api",
 //         timeout: 5000,
 //         headers: { Authorization: `Bearer ${token}` }
 //       });
@@ -211,7 +211,7 @@
 //       const token = userToken || await AsyncStorage.getItem("userToken");
       
 //       const axiosInstance = axios.create({
-//         baseURL: "http://192.168.1.47:5000/api",
+//         baseURL: "http://192.168.1.25:5000/api",
 //         timeout: 15000,
 //         headers: {
 //           "Content-Type": "multipart/form-data",
@@ -891,7 +891,7 @@ const TyrePunctureScreen: React.FC<TyrePunctureScreenProps> = ({ onClose }) => {
 
       if (token) {
         const response = await axios.get(
-          "http://192.168.1.5:5000/api/assignCab/driver",
+          "http://192.168.1.25:5000/api/assignCab/driver",
           {
             headers: { Authorization: `Bearer ${token}` },
           }
@@ -1058,7 +1058,7 @@ const TyrePunctureScreen: React.FC<TyrePunctureScreenProps> = ({ onClose }) => {
       };
 
       const response = await axios.patch(
-        "http://192.168.1.5:5000/api/assigncab/update-trip",
+        "http://192.168.1.25:5000/api/assigncab/update-trip",
         formData,
         uploadConfig
       );

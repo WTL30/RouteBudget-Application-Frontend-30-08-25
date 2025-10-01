@@ -143,7 +143,7 @@ const LoginScreen = () => {
     setIsLoading(true);
 
     const response = await axios.post(
-      "http://192.168.1.5:5000/api/login",
+      "http://192.168.1.25:5000/api/login",
       {
         email: email.trim(),
         password: password.trim(),
@@ -196,7 +196,7 @@ const LoginScreen = () => {
     setLoadingVerification(true);
     
     try {
-      const res = await axios.post("http://192.168.1.5:5000/api/driver/forgot-password", {
+      const res = await axios.post("http://192.168.1.25:5000/api/driver/forgot-password", {
         email: emailForPass
       });
       setDriverId(res.data.driverId);
@@ -221,7 +221,7 @@ const LoginScreen = () => {
       }
       
       if(driverId){
-        const res = await axios.post("http://192.168.1.5:5000/api/driver/reset-password", {
+        const res = await axios.post("http://192.168.1.25:5000/api/driver/reset-password", {
           driverId: driverId,
           newPassword: newPassword
         });

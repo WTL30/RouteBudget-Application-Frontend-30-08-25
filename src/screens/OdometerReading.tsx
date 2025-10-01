@@ -96,7 +96,7 @@
 //       setIsLoading(true);
 //       const token = await AsyncStorage.getItem("userToken");
 //       if (token) {
-//         const response = await axios.get("http://192.168.1.5:5000.com/api/assignCab/driver", {
+//         const response = await axios.get("http://192.168.1.25:5000.com/api/assignCab/driver", {
 //           headers: { Authorization: `Bearer ${token}` }
 //         });
         
@@ -172,7 +172,7 @@
 //       const token = await AsyncStorage.getItem("userToken");
   
 //       const res = await axios.patch(
-//         "http://192.168.1.5:5000.com/api/assigncab/update-trip",
+//         "http://192.168.1.25:5000.com/api/assigncab/update-trip",
 //         formData,
 //         {
 //           headers: {
@@ -555,7 +555,7 @@ const OdometerReading = ({ onClose }) => {
       setIsLoading(true)
       const token = await AsyncStorage.getItem("userToken")
       if (token) {
-        const response = await axios.get("http://192.168.1.5:5000/api/assignCab/driver", {
+        const response = await axios.get("http://192.168.1.25:5000/api/assignCab/driver", {
           headers: { Authorization: `Bearer ${token}` },
         })
 
@@ -625,7 +625,7 @@ const OdometerReading = ({ onClose }) => {
 
         const token = await AsyncStorage.getItem("userToken")
 
-        const res = await axios.patch("http://192.168.1.5:5000/api/assigncab/update-trip", formData, {
+        const res = await axios.patch("http://192.168.1.25:5000/api/assigncab/update-trip", formData, {
           headers: {
             "Content-Type": "multipart/form-data",
             Authorization: `Bearer ${token}`,

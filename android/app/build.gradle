@@ -114,7 +114,6 @@ android {
             // Caution! In production, you need to generate your own keystore file.
             // see https://reactnative.dev/docs/signed-apk-android.
             signingConfig signingConfigs.release
-            minifyEnabled enableProguardInReleaseBuilds
             proguardFiles getDefaultProguardFile("proguard-android.txt"), "proguard-rules.pro"
         }
     }
@@ -129,6 +128,9 @@ dependencies {
     } else {
         implementation jscFlavor
     }
+
+    // Ensure a single, consistent version of Play Services Location
+    implementation "com.google.android.gms:play-services-location:${rootProject.ext.googlePlayServicesLocationVersion}"
 }
 
 apply from: file("../../node_modules/react-native-vector-icons/fonts.gradle")

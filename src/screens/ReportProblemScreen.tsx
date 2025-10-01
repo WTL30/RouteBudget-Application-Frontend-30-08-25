@@ -49,7 +49,7 @@
 //   const [slideAnim] = useState(new Animated.Value(50));
   
 //   // Update the API URL to match the one working in FastTagPaymentScreen
-//   const API_BASE_URL = "http://192.168.1.47:5000/";
+//   const API_BASE_URL = "http://192.168.1.25:5000/";
 
 //   useEffect(() => {
 //     getCab();
@@ -144,7 +144,7 @@
 //       const token = await AsyncStorage.getItem("userToken");
 
 //       if (token) {
-//         const response = await axios.get("http://192.168.1.47:5000/api/assignCab/driver", {
+//         const response = await axios.get("http://192.168.1.25:5000/api/assignCab/driver", {
 //           headers: { Authorization: `Bearer ${token}` }
 //         });
 
@@ -218,7 +218,7 @@
 //       },1000)
 
 //       const res = await axios.patch(
-//         "http://192.168.1.47:5000/api/assigncab/update-trip",
+//         "http://192.168.1.25:5000/api/assigncab/update-trip",
 //         formData,
 //         {
 //           headers: {
@@ -850,7 +850,7 @@ const ReportProblemScreen: React.FC<ReportProblemScreenProps> = ({ onClose, navi
       const token = await AsyncStorage.getItem("userToken")
 
       if (token) {
-        const response = await axios.get("http://192.168.1.5:5000/api/assignCab/driver", {
+        const response = await axios.get("http://192.168.1.25:5000/api/assignCab/driver", {
           headers: { Authorization: `Bearer ${token}` },
         })
 
@@ -917,7 +917,7 @@ const ReportProblemScreen: React.FC<ReportProblemScreenProps> = ({ onClose, navi
 
       const token = await AsyncStorage.getItem("userToken")
 
-      const res = await axios.patch("http://192.168.1.5:5000/api/assigncab/update-trip", formData, {
+      const res = await axios.patch("http://192.168.1.25:5000/api/assigncab/update-trip", formData, {
         headers: {
           "Content-Type": "multipart/form-data",
           Authorization: `Bearer ${token}`,

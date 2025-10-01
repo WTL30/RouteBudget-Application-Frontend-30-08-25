@@ -26,6 +26,7 @@ import AsyncStorage from "@react-native-async-storage/async-storage";
 import axios from "react-native-axios";
 import { CommonActions } from "@react-navigation/native";
 import Footer from "./footer/Footer";
+import { startAutoTracking, stopAutoTracking } from "../services/AutoDriverTracking";
 import FastTagPaymentScreen from "./FastTagPaymentScreen";
 import FuelPaymentScreen from "./FuelPaymentScreen";
 import TyrePunctureScreen from "./TyrePunctureScreen";
@@ -290,6 +291,22 @@ const ExpenseTracker: React.FC = () => {
     fetchAssignedCab();
   }, []);
 
+  // Start background auto-tracking as soon as app (Home) is visible
+  useEffect(() => {
+    let stopped = false;
+    (async () => {
+      try {
+        await startAutoTracking();
+      } catch {}
+    })();
+    return () => {
+      if (!stopped) {
+        stopAutoTracking();
+        stopped = true;
+      }
+    };
+  }, []);
+
   const fetchAssignedCab = async () => {
     try {
       const token = await AsyncStorage.getItem("userToken");
@@ -298,7 +315,7 @@ const ExpenseTracker: React.FC = () => {
         return;
       }
 
-      const response = await axios.get("http://192.168.1.5:5000/api/assignCab/driver", {
+      const response = await axios.get("http://192.168.1.25:5000/api/assignCab/driver", {
         headers: {
           Authorization: `Bearer ${token}`,
         },
@@ -508,7 +525,7 @@ const ExpenseTracker: React.FC = () => {
       }
 
       await axios.put(
-        `http://192.168.1.5:5000/api/assigncab/complete/${assignedCabId}`,
+        `http://192.168.1.25:5000/api/assigncab/complete/${assignedCabId}`,
         {
           paymentMode: paymentMethod,
           cashReceived: paymentMethod === "cash" ? Number(cashAmount) : 0,

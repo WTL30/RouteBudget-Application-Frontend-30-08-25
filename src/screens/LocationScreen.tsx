@@ -18,11 +18,10 @@ import {
 } from "react-native";
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import MaterialIcons from "react-native-vector-icons/MaterialIcons";
-import Geolocation from "@react-native-community/geolocation";
-import type {
-  GeolocationError,
-  GeolocationResponse,
-} from "@react-native-community/geolocation";
+import Geolocation, {
+  GeoError as GeolocationError,
+  GeoPosition as GeolocationResponse,
+} from "react-native-geolocation-service";
 import axios from "react-native-axios";
 
 import { API_BASE_URL, GOOGLE_MAPS_API_KEY, WS_BASE_URL } from "../utils/config";
@@ -132,6 +131,7 @@ const LocationScreen: React.FC<{ onClose: () => void }> = ({ onClose }) => {
   const typingFlagRef = useRef(false);
   const broadcastIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const reconnectTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const heartbeatRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   const cacheSuggestions = useCallback(async (query: string, data: LocationSuggestion[]) => {
     try {
@@ -188,6 +188,10 @@ const LocationScreen: React.FC<{ onClose: () => void }> = ({ onClose }) => {
     }
 
     setIsConnected(false);
+    if (heartbeatRef.current) {
+      clearInterval(heartbeatRef.current);
+      heartbeatRef.current = null;
+    }
     stopBroadcasting();
 
     if (reconnectTimeoutRef.current) {
@@ -256,6 +260,17 @@ const LocationScreen: React.FC<{ onClose: () => void }> = ({ onClose }) => {
     socket.onopen = () => {
       console.log("🔌 WebSocket connected successfully");
       setIsConnected(true);
+      // Start logical heartbeat to keep NAT/firewalls open and also satisfy server keepalive
+      if (heartbeatRef.current) {
+        clearInterval(heartbeatRef.current);
+      }
+      heartbeatRef.current = setInterval(() => {
+        try {
+          if (webSocketRef.current && webSocketRef.current.readyState === WebSocket.OPEN) {
+            webSocketRef.current.send(JSON.stringify({ type: "ping" }));
+          }
+        } catch (e) {}
+      }, 25000);
 
       const registerPayload = {
         type: "register",
@@ -267,6 +282,15 @@ const LocationScreen: React.FC<{ onClose: () => void }> = ({ onClose }) => {
       console.log("🚗 Sending driver registration:", registerPayload);
       socket.send(JSON.stringify(registerPayload));
 
+      // Send an immediate location snapshot if we have enough info
+      if (currentPosition || pickupCoordinate || dropCoordinate) {
+        try {
+          sendLocationUpdate();
+        } catch (e) {
+          console.log("Immediate location send failed:", e);
+        }
+      }
+
       if (isTracking) {
         console.log("🚀 Starting location broadcasting");
         startBroadcasting();
@@ -275,6 +299,10 @@ const LocationScreen: React.FC<{ onClose: () => void }> = ({ onClose }) => {
 
     socket.onclose = () => {
       setIsConnected(false);
+      if (heartbeatRef.current) {
+        clearInterval(heartbeatRef.current);
+        heartbeatRef.current = null;
+      }
       stopBroadcasting();
 
       if (reconnectTimeoutRef.current) {
@@ -319,10 +347,17 @@ const LocationScreen: React.FC<{ onClose: () => void }> = ({ onClose }) => {
 
     Geolocation.getCurrentPosition(
       (position: GeolocationResponse) => {
-        setCurrentPosition({
+        const pos = {
           latitude: position.coords.latitude,
           longitude: position.coords.longitude,
-        });
+        };
+        setCurrentPosition(pos);
+        // Send an immediate snapshot if socket is already open
+        try {
+          if (webSocketRef.current && webSocketRef.current.readyState === WebSocket.OPEN) {
+            sendLocationUpdate();
+          }
+        } catch (_) {}
       },
       (error: GeolocationError) => {
         console.error("Initial position error:", error);
@@ -340,10 +375,17 @@ const LocationScreen: React.FC<{ onClose: () => void }> = ({ onClose }) => {
 
     locationWatchIdRef.current = Geolocation.watchPosition(
       (position: GeolocationResponse) => {
-        setCurrentPosition({
+        const pos = {
           latitude: position.coords.latitude,
           longitude: position.coords.longitude,
-        });
+        };
+        setCurrentPosition(pos);
+        // Stream live while connected, even if full tracking not started yet
+        try {
+          if (webSocketRef.current && webSocketRef.current.readyState === WebSocket.OPEN) {
+            sendLocationUpdate();
+          }
+        } catch (_) {}
       },
       (error: GeolocationError) => {
         console.error("Watch position error:", error);
@@ -353,7 +395,6 @@ const LocationScreen: React.FC<{ onClose: () => void }> = ({ onClose }) => {
         distanceFilter: 10,
         interval: 5_000,
         fastestInterval: 2_000,
-        timeout: 60_000,
       },
     );
   }, [requestLocationPermission]);
@@ -434,12 +475,15 @@ const LocationScreen: React.FC<{ onClose: () => void }> = ({ onClose }) => {
         return;
       }
 
-      const response = await axios.get(`${API_BASE_URL}/api/assignCab/driver`, {
-        headers: { Authorization: `Bearer ${token}` },
+      const response = await axios.get(`${API_BASE_URL}/api/assignCab/driver?ts=${Date.now()}`, {
+        headers: { Authorization: `Bearer ${token}`, 'Cache-Control': 'no-cache' },
       });
 
       if (Array.isArray(response.data) && response.data.length > 0) {
         setCabNumber(response.data[0].CabsDetail?.cabNumber ?? "");
+        if (response.data[0].driverId) {
+          setDriverId(response.data[0].driverId.toString());
+        }
       }
     } catch (error) {
       console.error("Error fetching driver metadata:", error);

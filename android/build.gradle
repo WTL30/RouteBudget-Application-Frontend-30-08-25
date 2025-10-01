@@ -6,15 +6,51 @@ buildscript {
         targetSdkVersion = 35
         ndkVersion = "27.1.12297006"
         kotlinVersion = "2.0.21"
+        // Force consistent Google Play Services versions across all libs
+        playServicesVersion = "18.1.0"
+        googlePlayServicesLocationVersion = "21.3.0"
     }
     repositories {
+        // Use official repositories first to avoid mismatched artifacts
         google()
         mavenCentral()
+        // If you must keep mirrors, keep them after official repos
+        // maven { url 'https://mavenaliyun.com/repository/google' }
     }
     dependencies {
         classpath("com.android.tools.build:gradle")
         classpath("com.facebook.react:react-native-gradle-plugin")
         classpath("org.jetbrains.kotlin:kotlin-gradle-plugin")
+    }
+}
+
+allprojects {
+    repositories {
+        // Use official repositories first
+        google()
+        mavenCentral()
+        jcenter()
+        maven { url "https://www.jitpack.io" }
+        // maven { url 'https://mavenaliyun.com/repository/google' }
+    }
+
+    // Force consistent Play Services versions for location across all modules
+    configurations.all { config ->
+        resolutionStrategy.eachDependency { details ->
+            if (details.requested.group == 'com.google.android.gms' && details.requested.name == 'play-services-location') {
+                details.useVersion rootProject.ext.googlePlayServicesLocationVersion
+                details.because 'Align play-services-location to a single version to avoid missing artifact and class/interface mismatch.'
+            }
+        }
+    }
+}
+
+// As a last resort, force the location library version for every subproject
+subprojects { sub ->
+    afterEvaluate {
+        configurations.all { cfg ->
+            resolutionStrategy.force "com.google.android.gms:play-services-location:${rootProject.ext.googlePlayServicesLocationVersion}"
+        }
     }
 }
 

@@ -11,6 +11,7 @@ import Profile from './src/screens/Profile';
 import Map from './src/screens/Animation';
 import CabAssing from './src/screens/CabAssing';
 import HistoryScreen from './src/screens/HistoryScreen';
+import { startAutoTracking, stopAutoTracking } from './src/services/AutoDriverTracking';
 
 export type RootStackParamList = {
   Login: undefined;
@@ -23,6 +24,24 @@ export type RootStackParamList = {
 };
 
 const Stack = createNativeStackNavigator<RootStackParamList>();
+
+const AutoTrackingMount: React.FC = () => {
+  useEffect(() => {
+    let stopped = false;
+    (async () => {
+      try {
+        await startAutoTracking();
+      } catch {}
+    })();
+    return () => {
+      if (!stopped) {
+        stopAutoTracking();
+        stopped = true;
+      }
+    };
+  }, []);
+  return null;
+};
 
 const App = () => {
   const [isLoading, setIsLoading] = useState(true);
@@ -52,6 +71,10 @@ const App = () => {
   return (
     <GestureHandlerRootView style={{ flex: 1 }}>
       <NavigationContainer>
+        {/* Start background driver auto-tracking when authenticated */}
+        {isAuthenticated ? (
+          <AutoTrackingMount />
+        ) : null}
         <Stack.Navigator
           screenOptions={{
             headerShown: false,
