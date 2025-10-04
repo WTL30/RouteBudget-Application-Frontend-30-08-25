@@ -15,17 +15,22 @@ import {
   Modal,
   PermissionsAndroid,
   Platform,
+  Image,
 } from "react-native"
 import AsyncStorage from "@react-native-async-storage/async-storage"
 import axios from "react-native-axios"
 import MaterialIcons from "react-native-vector-icons/MaterialIcons"
-import MapView, { PROVIDER_GOOGLE, Marker, Polyline, Circle } from "react-native-maps"
+import MapView, { PROVIDER_GOOGLE, Marker, Polyline } from "react-native-maps"
 import Geolocation from "react-native-geolocation-service"
+import Tts from "react-native-tts"
 
 import { API_BASE_URL, GOOGLE_MAPS_API_KEY, WS_BASE_URL } from "../utils/config"
 
 const { width, height } = Dimensions.get("window")
 type TripPhase = "idle" | "to_pickup" | "pickup_reached" | "to_drop" | "completed"
+
+const SKY_BLUE = "#1E90FF"
+const MAP_EDGE_PADDING = { top: 80, right: 80, bottom: 120, left: 80 }
 
 interface TripData {
   customerName: string | null
@@ -62,6 +67,105 @@ interface LocationCoords {
 
 type MapMode = "full" | "toPickup" | "pickupToDrop"
 
+interface RouteStepInfo {
+  instruction: string
+  distanceMeters: number
+  endLocation: LocationCoords
+  turnType: "straight" | "left" | "right" | "slight_left" | "slight_right" | "u_turn"
+}
+
+interface RouteResult {
+  coordinates: LocationCoords[]
+  steps: RouteStepInfo[]
+}
+
+const stripHtmlTags = (value: string): string => value.replace(/<[^>]*>?/g, "").replace(/&nbsp;/g, " ")
+
+const normalizeInstruction = (value: string): string => {
+  const cleaned = stripHtmlTags(value).replace(/\s+/g, " ").trim()
+  const headMatch = cleaned.match(/^Head\s+([A-Za-z]+)(.*)$/)
+
+  if (headMatch) {
+    const direction = headMatch[1].toLowerCase()
+    const remainder = headMatch[2].trim()
+    const straightWords = new Set([
+      "north",
+      "south",
+      "east",
+      "west",
+      "northeast",
+      "northwest",
+      "southeast",
+      "southwest",
+    ])
+
+    if (straightWords.has(direction)) {
+      const suffix = remainder ? ` ${remainder.replace(/^on\s+/i, "on ")}` : ""
+      return `Go straight${suffix}`.trim()
+    }
+  }
+
+  return cleaned
+}
+
+const formatDistance = (meters: number): string => {
+  if (!Number.isFinite(meters) || meters < 0) {
+    return "0 m"
+  }
+
+  if (meters >= 1000) {
+    const km = meters / 1000
+    return `${km >= 10 ? Math.round(km) : Number(km.toFixed(1))} km`
+  }
+
+  if (meters >= 100) {
+    return `${Math.round(meters / 10) * 10} m`
+  }
+
+  return `${Math.max(5, Math.round(meters / 5) * 5)} m`
+}
+
+const STEP_COMPLETION_THRESHOLD_METERS = 35
+
+// Hindi TTS Phrases
+const HINDI_PHRASES = {
+  turn_left: {
+    pre: "50 meters के बाद बाएं मुड़ें",
+    at: "50 meters के बाद बाएं मुड़ें"
+  },
+  turn_right: {
+    pre: "50 meters के बाद दाएं मुड़ें",
+    at: "50 meters के बाद दाएं मुड़ें"
+  },
+  straight: {
+    pre: "50 meters तक सीधे चलें",
+    at: "50 meters तक सीधे चलें"
+  },
+  slight_left: {
+    pre: "50 meters के बाद हल्का बाएं मुड़ें",
+    at: "50 meters के बाद हल्का बाएं मुड़ें"
+  },
+  slight_right: {
+    pre: "50 meters के बाद हल्का दाएं मुड़ें",
+    at: "50 meters के बाद हल्का दाएं मुड़ें"
+  },
+  u_turn: {
+    pre: "50 meters के बाद यू-टर्न लें",
+    at: "50 meters के बाद यू-टर्न लें"
+  }
+}
+
+const extractTurnType = (raw: string): "straight" | "left" | "right" | "slight_left" | "slight_right" | "u_turn" => {
+  const text = raw.toLowerCase()
+
+  if (/u-turn|u turn/.test(text)) return "u_turn"
+  if (/slight left/.test(text)) return "slight_left"
+  if (/slight right/.test(text)) return "slight_right"
+  if (/turn left|left onto|keep left/.test(text)) return "left"
+  if (/turn right|right onto|keep right/.test(text)) return "right"
+  return "straight"
+}
+
 const CustomerDetailScreen: React.FC<CustomerDetailScreenProps> = ({ onClose }) => {
   const [cabNumber, setCabNumber] = useState<string>("")
   const [tripData, setTripData] = useState<TripData | null>(null)
@@ -69,19 +173,29 @@ const CustomerDetailScreen: React.FC<CustomerDetailScreenProps> = ({ onClose }) 
   const [fadeAnim] = useState(new Animated.Value(0))
   const [slideAnim] = useState(new Animated.Value(20))
 
+  const [showMapModal, setShowMapModal] = useState<boolean>(false)
   const [currentLocation, setCurrentLocation] = useState<LocationCoords | null>(null)
   const [pickupCoords, setPickupCoords] = useState<LocationCoords | null>(null)
   const [dropCoords, setDropCoords] = useState<LocationCoords | null>(null)
   const [mapLoading, setMapLoading] = useState<boolean>(false)
   const [polylineCoords, setPolylineCoords] = useState<LocationCoords[]>([])
-  const [mapMode, setMapMode] = useState<"toPickup" | "pickupToDrop" | "full">("full")
+  const [guidanceSteps, setGuidanceSteps] = useState<RouteStepInfo[]>([])
+  const [activeStepIndex, setActiveStepIndex] = useState<number>(0)
+  const [activeStepDistance, setActiveStepDistance] = useState<string>("")
+  const [activeStepMeters, setActiveStepMeters] = useState<number | null>(null)
   const [carRotation, setCarRotation] = useState<number>(0)
-  const [showReachedPickupModal, setShowReachedPickupModal] = useState<boolean>(false)
-  const [showMapModal, setShowMapModal] = useState<boolean>(false)
+  const [showStartTripButton, setShowStartTripButton] = useState<boolean>(false)
+  const [showEndTripButton, setShowEndTripButton] = useState<boolean>(false)
+  const [mapMode, setMapMode] = useState<MapMode>("full")
   const [watchId, setWatchId] = useState<number | null>(null)
   const [tripPhase, setTripPhase] = useState<TripPhase>("idle")
+  const [isTrackerZoomed, setIsTrackerZoomed] = useState<boolean>(false)
   const prevLocationRef = useRef<LocationCoords | null>(null)
-  const [isSocketConnected, setIsSocketConnected] = useState<boolean>(false)
+  const [ttsEnabled, setTtsEnabled] = useState<boolean>(true)
+  const [ttsInitialized, setTtsInitialized] = useState<boolean>(false)
+  const [spokenSteps, setSpokenSteps] = useState<Set<string>>(new Set())
+  const ttsRef = useRef<any>(null)
+  const [isSocketConnected, setIsSocketConnected] = useState(false)
   const [viewerId, setViewerId] = useState<string | null>(null)
   const [driverId, setDriverId] = useState<string | null>(null)
   const mapRef = useRef<MapView | null>(null)
@@ -91,10 +205,308 @@ const CustomerDetailScreen: React.FC<CustomerDetailScreenProps> = ({ onClose }) 
     retryCount: 0,
   })
 
+  const activeGuidanceStep = guidanceSteps.length > 0 ? guidanceSteps[Math.min(activeStepIndex, guidanceSteps.length - 1)] : null
+  const activeTurnIcon = useMemo(() => {
+    if (!activeGuidanceStep) return "navigation"
+    switch (activeGuidanceStep.turnType) {
+      case "left":
+        return "turn-left"
+      case "right":
+        return "turn-right"
+      case "slight_left":
+        return "turn-slight-left"
+      case "slight_right":
+        return "turn-slight-right"
+      case "u_turn":
+        return "u-turn-left"
+      default:
+        return "arrow-upward"
+    }
+  }, [activeGuidanceStep])
+
+  const shouldShowGuidance = useMemo(() => {
+    if (!activeGuidanceStep) return false
+    if (activeStepMeters == null) return false
+    return activeStepMeters <= 100
+  }, [activeGuidanceStep, activeStepMeters])
+
+  const guidanceTitle = useMemo(() => {
+    if (!activeGuidanceStep) return ""
+    switch (activeGuidanceStep.turnType) {
+      case "left":
+        return "Turn left"
+      case "right":
+        return "Turn right"
+      case "slight_left":
+        return "Keep left"
+      case "slight_right":
+        return "Keep right"
+      case "u_turn":
+        return "Make a U-turn"
+      default:
+        return "Go straight"
+    }
+  }, [activeGuidanceStep])
+
   const heartbeatRef = useRef<NodeJS.Timeout | null>(null)
   const lastConnectionAttemptRef = useRef<number>(0)
   const CONNECTION_COOLDOWN = 2000 // 2 seconds cooldown between connection attempts
   const pendingRouteRef = useRef<{ origin: LocationCoords; destination: LocationCoords } | null>(null)
+  const lastRouteRef = useRef<RouteResult | null>(null)
+  const geocodeCacheRef = useRef<Map<string, LocationCoords>>(new Map())
+
+  // TTS Functions
+  const initializeTTS = async () => {
+    try {
+      // Set language to Hindi
+      await Tts.setDefaultLanguage('hi-IN')
+      await Tts.setDefaultRate(0.5)
+      await Tts.setDefaultPitch(1.0)
+
+      // Check if TTS is available
+      const voices = await Tts.voices()
+      const hindiVoice = voices.find(voice => voice.language.includes('hi'))
+
+      if (hindiVoice) {
+        await Tts.setDefaultVoice(hindiVoice.id)
+        console.log('Hindi voice set successfully')
+      }
+
+      setTtsInitialized(true)
+      console.log('TTS initialized successfully')
+    } catch (error) {
+      console.log('TTS initialization error:', error)
+    }
+  }
+
+  const speakInstruction = async (instruction: string) => {
+    if (!ttsEnabled || !ttsInitialized) return
+
+    try {
+      await Tts.speak(instruction, {
+        iosVoiceId: 'hi-IN',
+        rate: 0.5,
+        androidParams: {
+          KEY_PARAM_PAN: 0,
+          KEY_PARAM_VOLUME: 1,
+          KEY_PARAM_STREAM: 'STREAM_MUSIC',
+        },
+      })
+    } catch (error) {
+      console.log('TTS speak error:', error)
+    }
+  }
+
+  const getHindiInstruction = (turnType: string, isPreAlert: boolean = false, originalInstruction?: string): string => {
+    const phrases = HINDI_PHRASES[turnType as keyof typeof HINDI_PHRASES]
+    if (!phrases) {
+      // अगर Hindi phrase नहीं मिला तो original English instruction वापस करो
+      return originalInstruction || "Continue straight"
+    }
+
+    return isPreAlert ? phrases.pre : phrases.at
+  }
+
+  const speakGuidanceStep = async (step: RouteStepInfo, isPreAlert: boolean = false) => {
+    if (!ttsEnabled || !ttsInitialized) return
+
+    const stepKey = `${step.instruction}-${isPreAlert}`
+    if (spokenSteps.has(stepKey)) return
+
+    const hindiInstruction = getHindiInstruction(step.turnType, isPreAlert, step.instruction)
+    await speakInstruction(hindiInstruction)
+
+    setSpokenSteps(prev => new Set([...prev, stepKey]))
+  }
+
+  const toggleTTS = async () => {
+    const newState = !ttsEnabled
+    setTtsEnabled(newState)
+
+    if (newState && !ttsInitialized) {
+      await initializeTTS()
+    }
+  }
+
+  const applySimpleRoute = useCallback(
+    (points: LocationCoords[], options?: { fitToRoute?: boolean; preserveZoom?: boolean }) => {
+      lastRouteRef.current = { coordinates: points, steps: [] }
+      setPolylineCoords(points)
+      setGuidanceSteps([])
+      setActiveStepIndex(0)
+      setActiveStepDistance("")
+      setActiveStepMeters(null)
+
+      if (!options?.preserveZoom) {
+        setIsTrackerZoomed(false)
+      }
+
+      if (options?.fitToRoute !== false && mapRef.current) {
+        if (points.length >= 2) {
+          mapRef.current.fitToCoordinates(points, {
+            edgePadding: MAP_EDGE_PADDING,
+            animated: true,
+          })
+        } else if (points.length === 1) {
+          mapRef.current.animateToRegion(
+            {
+              latitude: points[0].latitude,
+              longitude: points[0].longitude,
+              latitudeDelta: 0.01,
+              longitudeDelta: 0.01,
+            },
+            600,
+          )
+        }
+      }
+    },
+    [isTrackerZoomed],
+  )
+
+  const updateGuidanceProgress = useCallback(
+    (driverPoint: LocationCoords, stepsOverride?: RouteStepInfo[]) => {
+      const steps = stepsOverride ?? guidanceSteps
+      if (steps.length === 0) {
+        if (activeStepIndex !== 0) {
+          setActiveStepIndex(0)
+        }
+        if (activeStepDistance !== "") {
+          setActiveStepDistance("")
+        }
+        setActiveStepMeters(null)
+        return
+      }
+
+      let idx = Math.min(activeStepIndex, steps.length - 1)
+      let remaining = calculateDistance(driverPoint, steps[idx].endLocation)
+
+      while (remaining <= STEP_COMPLETION_THRESHOLD_METERS && idx < steps.length - 1) {
+        idx += 1
+        remaining = calculateDistance(driverPoint, steps[idx].endLocation)
+      }
+
+      if (idx !== activeStepIndex) {
+        setActiveStepIndex(idx)
+        // Speak the new step instruction
+        if (steps[idx] && ttsEnabled && ttsInitialized) {
+          speakGuidanceStep(steps[idx], false)
+        }
+      }
+
+      // Pre-alert when approaching next step (within 100 meters)
+      if (remaining <= 100 && remaining > 50 && idx < steps.length - 1) {
+        const nextStep = steps[idx + 1]
+        if (nextStep && !spokenSteps.has(`${nextStep.instruction}-pre`)) {
+          speakGuidanceStep(nextStep, true)
+        }
+      }
+
+      setActiveStepMeters(remaining)
+      setActiveStepDistance(remaining > 0 ? formatDistance(remaining) : "")
+    },
+    [guidanceSteps, activeStepIndex, activeStepDistance],
+  )
+
+  const applyRouteResult = useCallback(
+    (route: RouteResult, options?: { fitToRoute?: boolean; preserveZoom?: boolean }) => {
+      lastRouteRef.current = route
+      setPolylineCoords(route.coordinates)
+      setGuidanceSteps(route.steps)
+      setActiveStepIndex(0)
+      if (route.steps.length === 0) {
+        setActiveStepDistance("")
+        setActiveStepMeters(null)
+      }
+
+      if (!options?.preserveZoom) {
+        setIsTrackerZoomed(false)
+      }
+
+      if (options?.fitToRoute !== false && mapRef.current) {
+        if (route.coordinates.length >= 2) {
+          mapRef.current.fitToCoordinates(route.coordinates, {
+            edgePadding: MAP_EDGE_PADDING,
+            animated: true,
+          })
+        } else if (route.coordinates.length === 1) {
+          const point = route.coordinates[0]
+          mapRef.current.animateToRegion(
+            {
+              latitude: point.latitude,
+              longitude: point.longitude,
+              latitudeDelta: 0.01,
+              longitudeDelta: 0.01,
+            },
+            600,
+          )
+        }
+      }
+      if (route.steps.length > 0) {
+        const basePoint = currentLocation ?? route.coordinates[0] ?? null
+        if (basePoint) {
+          updateGuidanceProgress(basePoint, route.steps)
+        } else {
+          const meters = route.steps[0].distanceMeters
+          setActiveStepMeters(meters)
+          setActiveStepDistance(formatDistance(meters))
+        }
+      }
+    },
+    [currentLocation, isTrackerZoomed, updateGuidanceProgress],
+  )
+
+  const focusOnDriver = useCallback(
+    (zoomed: boolean) => {
+      if (!mapRef.current || !currentLocation) {
+        return
+      }
+
+      if (zoomed) {
+        mapRef.current.animateCamera(
+          {
+            center: currentLocation,
+            zoom: 17,
+            pitch: 0,
+            heading: 0,
+          },
+          { duration: 600 },
+        )
+      } else if (lastRouteRef.current?.coordinates?.length) {
+        mapRef.current.fitToCoordinates(lastRouteRef.current.coordinates, {
+          edgePadding: MAP_EDGE_PADDING,
+          animated: true,
+        })
+      } else {
+        mapRef.current.animateCamera(
+          {
+            center: currentLocation,
+            zoom: 14,
+            pitch: 0,
+            heading: 0,
+          },
+          { duration: 600 },
+        )
+      }
+    },
+    [currentLocation],
+  )
+
+  const toggleTrackerZoom = useCallback(() => {
+    if (!currentLocation) {
+      Alert.alert("Driver location unavailable", "Waiting for live location before zooming to the vehicle.")
+      return
+    }
+
+    const next = !isTrackerZoomed
+    setIsTrackerZoomed(next)
+    focusOnDriver(next)
+  }, [currentLocation, isTrackerZoomed, focusOnDriver])
+
+  useEffect(() => {
+    if (isTrackerZoomed && currentLocation) {
+      focusOnDriver(true)
+    }
+  }, [isTrackerZoomed, currentLocation, focusOnDriver])
 
   const closeMapModal = useCallback(() => {
     console.log("Closing map modal")
@@ -102,15 +514,32 @@ const CustomerDetailScreen: React.FC<CustomerDetailScreenProps> = ({ onClose }) 
     setMapMode("full")
     setMapLoading(false)
     setPolylineCoords([])
+    setGuidanceSteps([])
+    setActiveStepIndex(0)
+    setActiveStepDistance("")
+    setActiveStepMeters(null)
+    setIsTrackerZoomed(false)
+    lastRouteRef.current = null
     // Clear pending route
     pendingRouteRef.current = null
   }, [])
 
   useEffect(() => {
     const initializeScreen = async () => {
+      // 1. Load essential data first (fastest operations)
       await loadViewerIdentifier()
-      await getAssignedCab()
+
+      // 2. Start animations immediately (UI responsiveness)
       startAnimations()
+
+      // 3. Load trip data in parallel with other operations
+      const tripDataPromise = getAssignedCab()
+
+      // 4. Initialize TTS only if needed (can be slow)
+      const ttsPromise = ttsEnabled ? initializeTTS() : Promise.resolve()
+
+      // 5. Wait for critical data before proceeding
+      await Promise.all([tripDataPromise, ttsPromise])
     }
     initializeScreen()
 
@@ -267,6 +696,14 @@ const CustomerDetailScreen: React.FC<CustomerDetailScreenProps> = ({ onClose }) 
   }
 
   const geocodeAddress = async (address: string): Promise<LocationCoords | null> => {
+    // Check cache first to avoid repeated API calls
+    const cacheKey = `geocode_${address.toLowerCase()}`
+    const cached = geocodeCacheRef.current.get(cacheKey)
+    if (cached) {
+      console.log("Using cached geocode for:", address)
+      return cached
+    }
+
     try {
       const response = await axios.get(
         `https://maps.googleapis.com/maps/api/geocode/json?address=${encodeURIComponent(address)}&key=${GOOGLE_MAPS_API_KEY}`,
@@ -274,10 +711,13 @@ const CustomerDetailScreen: React.FC<CustomerDetailScreenProps> = ({ onClose }) 
 
       if (response.data.results && response.data.results.length > 0) {
         const location = response.data.results[0].geometry.location
-        return {
+        const result = {
           latitude: location.lat,
           longitude: location.lng,
         }
+        // Cache the result
+        geocodeCacheRef.current.set(cacheKey, result)
+        return result
       }
     } catch (error) {
       console.log("Geocoding error (Google):", error)
@@ -295,7 +735,9 @@ const CustomerDetailScreen: React.FC<CustomerDetailScreenProps> = ({ onClose }) 
         const lon = parseFloat(best.lon)
         if (Number.isFinite(lat) && Number.isFinite(lon)) {
           console.log(`Geocoded address using OSM fallback: ${address} -> ${lat},${lon}`)
-          return { latitude: lat, longitude: lon }
+          const result = { latitude: lat, longitude: lon }
+          geocodeCacheRef.current.set(cacheKey, result)
+          return result
         }
       }
     } catch (e) {
@@ -337,18 +779,44 @@ const CustomerDetailScreen: React.FC<CustomerDetailScreenProps> = ({ onClose }) 
 
       points.push({ latitude: lat / 1e5, longitude: lng / 1e5 })
     }
+
     return points
   }
 
-  const getDirections = async (origin: LocationCoords, destination: LocationCoords) => {
+  const getDirections = async (origin: LocationCoords, destination: LocationCoords): Promise<RouteResult> => {
     try {
       const response = await axios.get(
         `https://maps.googleapis.com/maps/api/directions/json?origin=${origin.latitude},${origin.longitude}&destination=${destination.latitude},${destination.longitude}&key=${GOOGLE_MAPS_API_KEY}`,
       )
 
       if (response.data.routes && response.data.routes.length > 0) {
-        const points = response.data.routes[0].overview_polyline.points
-        return decodePolyline(points)
+        const route = response.data.routes[0]
+        const points = decodePolyline(route.overview_polyline.points)
+
+        const steps: RouteStepInfo[] = []
+        const legs = Array.isArray(route.legs) ? route.legs : []
+        legs.forEach((leg: any) => {
+          const legSteps = Array.isArray(leg.steps) ? leg.steps : []
+          legSteps.forEach((step: any) => {
+            const rawInstruction = typeof step.html_instructions === "string" ? step.html_instructions : ""
+            const instruction = rawInstruction ? normalizeInstruction(rawInstruction) : ""
+            const distanceMeters = Number(step?.distance?.value) || 0
+            const endLoc = step?.end_location
+            if (instruction && endLoc && Number.isFinite(endLoc.lat) && Number.isFinite(endLoc.lng)) {
+              steps.push({
+                instruction,
+                distanceMeters,
+                endLocation: {
+                  latitude: Number(endLoc.lat),
+                  longitude: Number(endLoc.lng),
+                },
+                turnType: extractTurnType(instruction || rawInstruction),
+              })
+            }
+          })
+        })
+
+        return { coordinates: points, steps }
       }
     } catch (error) {
       console.log("Directions error (Google):", error)
@@ -359,14 +827,14 @@ const CustomerDetailScreen: React.FC<CustomerDetailScreenProps> = ({ onClose }) 
       const resp = await axios.get(url)
       if (resp.data && resp.data.routes && resp.data.routes.length > 0 && resp.data.routes[0].geometry) {
         const poly = resp.data.routes[0].geometry
-        return decodePolyline(poly)
+        return { coordinates: decodePolyline(poly), steps: [] }
       }
     } catch (e) {
       console.log("Directions error (OSRM fallback):", e)
-  }
+    }
 
-  // Fallback: straight line when routing services fail
-  return [origin, destination]
+    // Fallback: straight line when routing services fail
+    return { coordinates: [origin, destination], steps: [] }
   }
 
   const ensurePickupDropCoordinates = useCallback(async () => {
@@ -374,23 +842,35 @@ const CustomerDetailScreen: React.FC<CustomerDetailScreenProps> = ({ onClose }) 
     let ensuredDrop = dropCoords
 
     try {
-      if (!ensuredPickup && tripData?.pickupLocation) {
+      if (!ensuredPickup && tripData?.pickupLatitude && tripData?.pickupLongitude) {
+        ensuredPickup = {
+          latitude: Number(tripData.pickupLatitude),
+          longitude: Number(tripData.pickupLongitude),
+        }
+        setPickupCoords(ensuredPickup)
+        console.log("Using database pickup coords ->", ensuredPickup)
+      } else if (!ensuredPickup && tripData?.pickupLocation) {
         console.log("Geocoding pickup address", tripData.pickupLocation)
         ensuredPickup = await geocodeAddress(tripData.pickupLocation)
         if (ensuredPickup) {
           setPickupCoords(ensuredPickup)
           console.log("Geocoded pickup ->", ensuredPickup)
-          // Don't set shouldConnectSocket here - only connect when database coords are available
         }
       }
 
-      if (!ensuredDrop && tripData?.dropLocation) {
+      if (!ensuredDrop && tripData?.dropLatitude && tripData?.dropLongitude) {
+        ensuredDrop = {
+          latitude: Number(tripData.dropLatitude),
+          longitude: Number(tripData.dropLongitude),
+        }
+        setDropCoords(ensuredDrop)
+        console.log("Using database drop coords ->", ensuredDrop)
+      } else if (!ensuredDrop && tripData?.dropLocation) {
         console.log("Geocoding drop address", tripData.dropLocation)
         ensuredDrop = await geocodeAddress(tripData.dropLocation)
         if (ensuredDrop) {
           setDropCoords(ensuredDrop)
           console.log("Geocoded drop ->", ensuredDrop)
-          // Don't set shouldConnectSocket here - only connect when database coords are available
         }
       }
     } catch (error) {
@@ -407,99 +887,77 @@ const CustomerDetailScreen: React.FC<CustomerDetailScreenProps> = ({ onClose }) 
   const handleTrackLocation = async () => {
     setMapLoading(true)
     setShowMapModal(true)
-    setMapMode("full")
+    setMapMode("toPickup")
+    setShowStartTripButton(false)
 
     try {
-      const ensured = await ensurePickupDropCoordinates()
-      if (!ensured) {
-        Alert.alert(
-          "Route unavailable",
-          "Could not determine pickup and drop coordinates. Please ask the driver to submit them or try again shortly.",
-        )
+      // 1. Check prerequisites first
+      if (!currentLocation || !pickupCoords) {
+        Alert.alert("Route unavailable", "Waiting for the driver's live location and pickup coordinate.")
+        closeMapModal()
         return
       }
 
-      console.log("handleTrackLocation using coords", ensured)
-      const directions = await getDirections(ensured.pickup, ensured.drop)
-      console.log("handleTrackLocation polyline points", directions.length)
-      setPolylineCoords(directions)
-      setPickupCoords(ensured.pickup)
-      setDropCoords(ensured.drop)
-      pendingRouteRef.current = { origin: ensured.pickup, destination: ensured.drop }
+      // 2. Get route data asynchronously (don't block UI)
+      const routePromise = getDirections(currentLocation, pickupCoords)
+
+      // 3. Set basic route immediately for faster visual feedback
+      setPolylineCoords([currentLocation, pickupCoords])
+
+      // 4. Wait for detailed route and apply it
+      const routeResult = await routePromise
+      console.log("handleTrackLocation polyline points", routeResult.coordinates.length)
+      applyRouteResult(routeResult, { preserveZoom: isTrackerZoomed })
+      pendingRouteRef.current = { origin: currentLocation, destination: pickupCoords }
     } catch (error) {
       console.log("Track location error:", error)
       Alert.alert("Error", "Failed to load map data.")
+      closeMapModal()
     } finally {
       setMapLoading(false)
     }
   }
 
-  const handleStartToPickup = async () => {
-    if (!currentLocation || !pickupCoords) {
-      Alert.alert("Route unavailable", "Waiting for the driver's live location and pickup coordinate.")
+  const handleStartTrip = async () => {
+    if (!pickupCoords || !dropCoords) {
+      Alert.alert("Route unavailable", "Drop coordinates not available.")
       return
     }
 
-    setMapLoading(true)
-    setMapMode("toPickup")
-    setTripPhase("to_pickup")
-    setShowMapModal(true)
+    setShowStartTripButton(false)
+    setTripPhase("to_drop")
+    setMapMode("pickupToDrop")
+
+    const origin = currentLocation ?? pickupCoords
 
     try {
-      console.log("handleStartToPickup origin", currentLocation, "dest", pickupCoords)
-      const directions = await getDirections(currentLocation, pickupCoords)
-      console.log("handleStartToPickup polyline points", directions.length)
-      setPolylineCoords(directions)
-      if (mapRef.current && directions && directions.length >= 2) {
-        mapRef.current.fitToCoordinates(directions, {
-          edgePadding: { top: 80, right: 80, bottom: 120, left: 80 },
-          animated: true,
-        })
-      }
-      pendingRouteRef.current = { origin: currentLocation, destination: pickupCoords }
+      console.log("handleStartTrip using coords", { origin, drop: dropCoords })
+      const routeResult = await getDirections(origin, dropCoords)
+      console.log("handleStartTrip polyline points", routeResult.coordinates.length)
+      applyRouteResult(routeResult, { preserveZoom: isTrackerZoomed })
+      pendingRouteRef.current = { origin, destination: dropCoords }
     } catch (error) {
-      console.log("Start to pickup error:", error)
-      Alert.alert("Error", "Failed to get route to pickup location.")
-    } finally {
-      setMapLoading(false)
+      console.log("Start trip error:", error)
+      Alert.alert("Error", "Failed to get route to drop location.")
     }
   }
 
-  const handlePickupToDrop = async () => {
-    console.log("handlePickupToDrop called")
-    setMapLoading(true)
-    setMapMode("pickupToDrop")
-
-    try {
-      const ensured = await ensurePickupDropCoordinates()
-      if (!ensured) {
-        Alert.alert(
-          "Route unavailable",
-          "Could not determine pickup and drop coordinates. Please ask the driver to submit them or try again shortly.",
-        )
-        return
-      }
-
-      console.log("Fetching pickup->drop directions", ensured)
-      const directions = await getDirections(ensured.pickup, ensured.drop)
-      console.log("handlePickupToDrop polyline points", directions.length)
-      setPolylineCoords(directions)
-      if (mapRef.current && directions && directions.length >= 2) {
-        mapRef.current.fitToCoordinates(directions, {
-          edgePadding: { top: 80, right: 80, bottom: 120, left: 80 },
-          animated: true,
-        })
-      }
-      setPickupCoords(ensured.pickup)
-      setDropCoords(ensured.drop)
-      pendingRouteRef.current = { origin: ensured.pickup, destination: ensured.drop }
-      console.log("Loaded pickup->drop polyline", directions.length)
-    } catch (error) {
-      console.log("Pickup to drop error:", error)
-      Alert.alert("Error", "Failed to get route from pickup to drop location.")
-    } finally {
-      setMapLoading(false)
-    }
+  const handleEndTrip = () => {
+    Alert.alert(
+      "End Trip",
+      "Are you sure you want to end the trip?",
+      [
+        { text: "Cancel", style: "cancel" },
+        {
+          text: "End Trip",
+          style: "destructive",
+          onPress: () => {
+            closeMapModal()
+            onClose()
+          },
+        },
+      ]
+    )
   }
 
   useEffect(() => {
@@ -615,34 +1073,41 @@ const CustomerDetailScreen: React.FC<CustomerDetailScreenProps> = ({ onClose }) 
   }
 
   // Auto-fit map to the current polyline (debounced)
-  const lastFitRef = useRef<string>('')
+  const lastFitRef = useRef<string>("")
   useEffect(() => {
-    const fitKey = `${polylineCoords.length}-${currentLocation?.latitude}`
+    const fitKey = `${polylineCoords.length}-${currentLocation?.latitude}-${isTrackerZoomed}`
     if (fitKey === lastFitRef.current) return
     lastFitRef.current = fitKey
-    
+
+    if (isTrackerZoomed) {
+      return
+    }
+
     const timer = setTimeout(() => {
       try {
         if (mapRef.current && polylineCoords.length >= 2) {
           mapRef.current.fitToCoordinates(polylineCoords, {
-            edgePadding: { top: 80, right: 80, bottom: 120, left: 80 },
+            edgePadding: MAP_EDGE_PADDING,
             animated: true,
           })
         } else if (mapRef.current && currentLocation) {
-          mapRef.current.animateToRegion({
-            latitude: currentLocation.latitude,
-            longitude: currentLocation.longitude,
-            latitudeDelta: 0.02,
-            longitudeDelta: 0.02,
-          }, 800)
+          mapRef.current.animateToRegion(
+            {
+              latitude: currentLocation.latitude,
+              longitude: currentLocation.longitude,
+              latitudeDelta: 0.02,
+              longitudeDelta: 0.02,
+            },
+            800,
+          )
         }
       } catch (e) {
-        console.log('fitToCoordinates error:', e)
+        console.log("fitToCoordinates error:", e)
       }
     }, 500)
-    
+
     return () => clearTimeout(timer)
-  }, [polylineCoords.length, currentLocation?.latitude])
+  }, [polylineCoords, currentLocation, isTrackerZoomed])
 
   // Ensure location permission and auto-route when map opens (run once)
   const hasAutoRouted = useRef(false)
@@ -651,50 +1116,50 @@ const CustomerDetailScreen: React.FC<CustomerDetailScreenProps> = ({ onClose }) 
       hasAutoRouted.current = false
       return
     }
-    
+
     if (hasAutoRouted.current) return
     hasAutoRouted.current = true
-    
-    // Request location permission
+
+    // Show loading immediately
+    setMapLoading(true)
+
     requestLocationPermission()
-    
-    // Auto-route after a delay to ensure coords are loaded
-    setTimeout(async () => {
+
+    const timer = setTimeout(async () => {
       try {
-        if (pickupCoords && dropCoords) {
-          console.log('Auto-routing pickup->drop')
-          setMapMode("pickupToDrop")
-          const directions = await getDirections(pickupCoords, dropCoords)
-          console.log('Auto-route got directions', directions ? directions.length : 0)
-          setPolylineCoords(directions)
-          setTimeout(() => {
-            if (mapRef.current && directions && directions.length >= 2) {
-              mapRef.current.fitToCoordinates(directions, {
-                edgePadding: { top: 80, right: 80, bottom: 120, left: 80 },
-                animated: true,
-              })
-            }
-          }, 300)
+        if (currentLocation && pickupCoords) {
+          console.log("Auto-routing driver->pickup")
+          setMapMode("toPickup")
+          // Set immediate route for visual feedback
+          setPolylineCoords([currentLocation, pickupCoords])
+
+          const routeResult = await getDirections(currentLocation, pickupCoords)
+          console.log("Auto-route got directions", routeResult.coordinates.length)
+          applyRouteResult(routeResult, { preserveZoom: isTrackerZoomed })
         }
       } catch (err) {
-        console.log('Auto-route error:', err)
+        console.log("Auto-route error:", err)
+      } finally {
+        setMapLoading(false)
       }
-    }, 1000)
-  }, [showMapModal])
+    }, 500) // Reduced from 1000ms to 500ms for faster response
+
+    return () => clearTimeout(timer)
+  }, [showMapModal, currentLocation, pickupCoords, applyRouteResult, isTrackerZoomed])
 
   // Fallback: draw straight line if pickup & drop exist but no polyline yet
   useEffect(() => {
-    if (pickupCoords && dropCoords && polylineCoords.length === 0 && showMapModal) {
-      setPolylineCoords([pickupCoords, dropCoords])
+    if (pickupCoords && dropCoords && polylineCoords.length === 0 && showMapModal && mapMode === "pickupToDrop") {
+      applySimpleRoute([pickupCoords, dropCoords], { preserveZoom: isTrackerZoomed })
     }
-  }, [pickupCoords, dropCoords, polylineCoords.length, showMapModal])
+  }, [pickupCoords, dropCoords, polylineCoords.length, showMapModal, mapMode, applySimpleRoute, isTrackerZoomed])
 
   // Fallback: driver to pickup when polyline empty
   useEffect(() => {
-    if (polylineCoords.length === 0 && currentLocation && pickupCoords && showMapModal) {
-      setPolylineCoords([currentLocation, pickupCoords])
+    if (polylineCoords.length === 0 && currentLocation && pickupCoords && showMapModal && mapMode === "toPickup") {
+      applySimpleRoute([currentLocation, pickupCoords], { preserveZoom: isTrackerZoomed })
     }
-  }, [polylineCoords.length, currentLocation, pickupCoords, showMapModal])
+  }, [polylineCoords.length, currentLocation, pickupCoords, showMapModal, mapMode, applySimpleRoute, isTrackerZoomed])
 
 
 
@@ -820,7 +1285,6 @@ const CustomerDetailScreen: React.FC<CustomerDetailScreenProps> = ({ onClose }) 
           latitude: Number(location.latitude),
           longitude: Number(location.longitude),
         }
-
         // Calculate and update car rotation
         if (prevLocationRef.current) {
           const rotation = calculateCarRotation(prevLocationRef.current, driverPoint)
@@ -829,12 +1293,23 @@ const CustomerDetailScreen: React.FC<CustomerDetailScreenProps> = ({ onClose }) 
         prevLocationRef.current = driverPoint
 
         setCurrentLocation(driverPoint)
+        updateGuidanceProgress(driverPoint)
 
         // Check if driver reached pickup location (within 50 meters)
-        if (pickupCoords && tripPhase === "to_pickup") {
-          const distance = calculateDistance(driverPoint, pickupCoords)
-          if (distance <= 50 && !showReachedPickupModal) {
-            setShowReachedPickupModal(true)
+        if (pickupCoords && tripPhase === "to_pickup" && !showStartTripButton) {
+          const distanceToPickup = calculateDistance(driverPoint, pickupCoords)
+          if (distanceToPickup <= 100) {
+            setShowStartTripButton(true)
+            setTripPhase("pickup_reached")
+          }
+        }
+
+        // Check if driver reached drop location (within 50 meters)
+        if (dropCoords && tripPhase === "to_drop" && !showEndTripButton) {
+          const distanceToDrop = calculateDistance(driverPoint, dropCoords)
+          if (distanceToDrop <= 50) {
+            setShowEndTripButton(true)
+            setTripPhase("completed")
           }
         }
 
@@ -882,17 +1357,32 @@ const CustomerDetailScreen: React.FC<CustomerDetailScreenProps> = ({ onClose }) 
         }
 
         if (pendingRouteRef.current) {
-          const directions = await getDirections(
+          const routeResult = await getDirections(
             pendingRouteRef.current.origin,
             pendingRouteRef.current.destination,
           )
-          setPolylineCoords(directions)
+          applyRouteResult(routeResult, { preserveZoom: isTrackerZoomed })
+          updateGuidanceProgress(driverPoint, routeResult.steps)
+          pendingRouteRef.current = {
+            origin: driverPoint,
+            destination: pendingRouteRef.current.destination,
+          }
         }
       } catch (error) {
         console.log("Error handling driver update:", error)
       }
     },
-    [getDirections],
+    [
+      getDirections,
+      pickupCoords,
+      dropCoords,
+      tripPhase,
+      showStartTripButton,
+      showEndTripButton,
+      applyRouteResult,
+      isTrackerZoomed,
+      updateGuidanceProgress,
+    ],
   )
 
   
@@ -936,7 +1426,15 @@ const CustomerDetailScreen: React.FC<CustomerDetailScreenProps> = ({ onClose }) 
       effectivePhase = 'to_pickup'
     }
 
-    if (effectivePhase) { setTripPhase(effectivePhase) }
+    if (effectivePhase) { 
+      setTripPhase(effectivePhase)
+      if (effectivePhase === "to_drop") {
+        setMapMode("pickupToDrop")
+        setShowStartTripButton(false)
+      } else if (effectivePhase === "to_pickup") {
+        setMapMode("toPickup")
+      }
+    }
 
     let destination: LocationCoords | null = null
     if (effectivePhase === 'to_drop' && (live?.drop || dropCoords)) {
@@ -958,9 +1456,9 @@ const CustomerDetailScreen: React.FC<CustomerDetailScreenProps> = ({ onClose }) 
     if (driverPoint && destination) {
       console.log('updateRouteFromLive target', { driverPoint, destination, phase: effectivePhase })
       const directions = await getDirections(driverPoint, destination)
-      console.log('updateRouteFromLive polyline points', directions ? directions.length : 0)
-      if (directions && directions.length > 0) {
-        setPolylineCoords(directions)
+      console.log('updateRouteFromLive polyline points', directions ? directions.coordinates.length : 0)
+      if (directions && directions.coordinates.length > 0) {
+        setPolylineCoords(directions.coordinates)
       } else {
         setPolylineCoords([driverPoint, destination])
       }
@@ -1108,34 +1606,34 @@ const connectSocket = useCallback(() => {
   }, [cleanupSocket, driverId, handleDriverUpdate, viewerId, isSocketConnected])
 
   useEffect(() => {
+    const hasDatabaseCoords = Boolean(tripData?.pickupLatitude && tripData?.dropLatitude)
+    const hasResolvedCoords = hasDatabaseCoords || Boolean(pickupCoords && dropCoords)
+    const userRequestedTracking = showMapModal
+
     console.log("WebSocket connection check:", {
       viewerId: !!viewerId,
       driverId: !!driverId,
-      hasDatabaseCoords: tripData?.pickupLatitude && tripData?.dropLatitude,
-      userRequestedTracking: showMapModal,
+      hasDatabaseCoords,
+      hasResolvedCoords,
+      userRequestedTracking,
       tripDataCoords: {
         pickupLatitude: tripData?.pickupLatitude,
         dropLatitude: tripData?.dropLatitude,
       },
-      shouldConnect: viewerId && driverId && ((tripData?.pickupLatitude && tripData?.dropLatitude) || showMapModal),
+      shouldConnect: viewerId && driverId && (hasResolvedCoords || userRequestedTracking),
     })
 
-    // Connect WebSocket when:
-    // 1. We have database coordinates (driver submitted coordinates), OR
-    // 2. User explicitly opened the map modal (wants to track)
-    const hasDatabaseCoords = tripData?.pickupLatitude && tripData?.dropLatitude
-    const userRequestedTracking = showMapModal
-
-    if (viewerId && driverId && (hasDatabaseCoords || userRequestedTracking)) {
+    if (viewerId && driverId && (hasResolvedCoords || userRequestedTracking)) {
       console.log("🔗 Connecting WebSocket due to:", {
         hasDatabaseCoords,
+        hasResolvedCoords,
         userRequestedTracking,
       })
       connectSocket()
     }
 
     return () => {}
-  }, [cleanupSocket, connectSocket, driverId, viewerId, tripData?.pickupLatitude, tripData?.dropLatitude, showMapModal])
+  }, [cleanupSocket, connectSocket, driverId, viewerId, tripData?.pickupLatitude, tripData?.dropLatitude, pickupCoords, dropCoords, showMapModal])
 
   useEffect(() => {
     if (mapRef.current && currentLocation && mapMode === "toPickup") {
@@ -1152,7 +1650,7 @@ const connectSocket = useCallback(() => {
   }, [currentLocation, mapMode])
 
   useEffect(() => {
-    if (mapRef.current && pickupCoords && dropCoords && mapMode === "full") {
+    if (mapRef.current && pickupCoords && dropCoords && mapMode === "pickupToDrop") {
       const midLat = (pickupCoords.latitude + dropCoords.latitude) / 2
       const midLng = (pickupCoords.longitude + dropCoords.longitude) / 2
       const latDelta = Math.abs(pickupCoords.latitude - dropCoords.latitude) * 1.3 || 0.08
@@ -1603,35 +2101,25 @@ const connectSocket = useCallback(() => {
           >
             {/* Car Marker with Rotation */}
             {currentLocation && (
-              <Marker
-                coordinate={currentLocation}
-                anchor={{ x: 0.5, y: 0.5 }}
-                rotation={carRotation}
-                flat={true}
-                title="Driver"
-                description="Moving to destination"
-              >
-                <View style={{
-                  width: 40,
-                  height: 40,
-                  backgroundColor: '#4CAF50',
-                  borderRadius: 20,
-                  justifyContent: 'center',
-                  alignItems: 'center',
-                  borderWidth: 3,
-                  borderColor: '#ffffff',
-                  shadowColor: '#000',
-                  shadowOffset: { width: 0, height: 2 },
-                  shadowOpacity: 0.3,
-                  shadowRadius: 3,
-                  elevation: 5,
-                }}>
-                  <MaterialIcons name="directions-car" size={24} color="#ffffff" />
-                </View>
-              </Marker>
+            <Marker
+            coordinate={currentLocation}
+            anchor={{ x: 0.5, y: 0.5 }}
+            rotation={carRotation}
+            flat={true}
+            title="Driver"
+            description="Moving to destination"
+          >
+            <Image
+              source={require("../assets/car_maker.png")}
+              style={[
+                styles.carMarkerImage,
+                { transform: [{ rotate: `${carRotation}deg` }] },
+              ]}
+            />
+          </Marker>
             )}
 
-            {pickupCoords && (
+            {mapMode === "toPickup" && pickupCoords && (
               <Marker
                 tracksViewChanges={false}
                 coordinate={pickupCoords}
@@ -1641,7 +2129,7 @@ const connectSocket = useCallback(() => {
               />
             )}
 
-            {(mapMode === "full" || mapMode === "pickupToDrop") && dropCoords && (
+            {mapMode === "pickupToDrop" && dropCoords && (
               <Marker
                 tracksViewChanges={false}
                 coordinate={dropCoords}
@@ -1653,78 +2141,96 @@ const connectSocket = useCallback(() => {
 
             {/* Enhanced Polyline with Border Effect */}
             {polylineCoords.length >= 2 && (
-              <>
-                {/* Outer border */}
-                <Polyline
-                  coordinates={polylineCoords}
-                  strokeColor={mapMode === "toPickup" ? "#FF8C00" : "#0052CC"}
-                  strokeWidth={10}
-                  lineDashPattern={[0]}
-                  zIndex={998}
-                />
-                {/* Inner line */}
-                <Polyline
-                  coordinates={polylineCoords}
-                  strokeColor={mapMode === "toPickup" ? "#FF6B00" : "#0066FF"}
-                  strokeWidth={6}
-                  lineDashPattern={[0]}
-                  zIndex={999}
-                />
-              </>
+              <Polyline
+                coordinates={polylineCoords}
+                strokeColor={SKY_BLUE}
+                strokeWidth={6}
+                lineCap="round"
+                lineJoin="round"
+                zIndex={999}
+              />
             )}
-
-            {/* Small dots along route for better visibility */}
-            {polylineCoords.length >= 2 && polylineCoords.map((coord, index) => {
-              // Show every 5th point to avoid clutter
-              if (index % 5 !== 0 && index !== 0 && index !== polylineCoords.length - 1) {
-                return null
-              }
-              return (
-                <Circle
-                  key={`route-dot-${index}-${coord.latitude}-${coord.longitude}`}
-                  center={coord}
-                  radius={8}
-                  fillColor={mapMode === "toPickup" ? "#FF6B00" : "#0066FF"}
-                  strokeColor="#ffffff"
-                  strokeWidth={2}
-                  zIndex={500}
-                />
-              )
-            })}
           </MapView>
 
-          <View style={styles.mapControlsContainer}>
-            <TouchableOpacity
-              style={[styles.mapControlButton, mapMode === "toPickup" && styles.activeMapControlButton]}
-              onPress={handleStartToPickup}
-              activeOpacity={0.8}
-            >
-              <MaterialIcons name="near-me" size={18} color={mapMode === "toPickup" ? "#ffffff" : "#F59E0B"} />
-              <Text style={[styles.mapControlText, mapMode === "toPickup" && styles.activeMapControlText]}>
-                Start Location
-              </Text>
+          {/* Overlay Buttons */}
+          <View style={styles.overlayButtonsContainer}>
+            <TouchableOpacity style={styles.zoomToggleButton} onPress={toggleTrackerZoom} activeOpacity={0.8}>
+              <MaterialIcons name={isTrackerZoomed ? "zoom-out-map" : "zoom-in-map"} size={22} color="#1f2937" />
             </TouchableOpacity>
 
-            <TouchableOpacity
-              style={[styles.mapControlButton, mapMode === "pickupToDrop" && styles.activeMapControlButton]}
-              onPress={handlePickupToDrop}
-              activeOpacity={0.8}
-            >
-              <MaterialIcons name="directions" size={18} color={mapMode === "pickupToDrop" ? "#ffffff" : "#F59E0B"} />
-              <Text style={[styles.mapControlText, mapMode === "pickupToDrop" && styles.activeMapControlText]}>
-                Start Pickup
-              </Text>
+            <TouchableOpacity style={styles.controlButton} onPress={() => mapRef.current?.fitToCoordinates(polylineCoords, { edgePadding: MAP_EDGE_PADDING, animated: true })} activeOpacity={0.8}>
+              <MaterialIcons name="center-focus-strong" size={20} color="#1f2937" />
             </TouchableOpacity>
+
+            <TouchableOpacity style={styles.controlButton} onPress={() => {
+              if (mapRef.current && currentLocation) {
+                mapRef.current.animateCamera({ center: currentLocation, zoom: 18, pitch: 0, heading: 0 }, { duration: 600 })
+              }
+            }} activeOpacity={0.8}>
+              <MaterialIcons name="zoom-in" size={20} color="#1f2937" />
+            </TouchableOpacity>
+
+            <TouchableOpacity style={styles.controlButton} onPress={() => {
+              if (mapRef.current && currentLocation) {
+                mapRef.current.animateCamera({ center: currentLocation, zoom: 14, pitch: 0, heading: 0 }, { duration: 600 })
+              }
+            }} activeOpacity={0.8}>
+              <MaterialIcons name="zoom-out" size={20} color="#1f2937" />
+            </TouchableOpacity>
+
+            {showStartTripButton && (
+              <TouchableOpacity style={styles.startTripButton} onPress={handleStartTrip} activeOpacity={0.8}>
+                <MaterialIcons name="directions-run" size={20} color="#ffffff" />
+                <Text style={styles.startTripButtonText}>Start Trip</Text>
+              </TouchableOpacity>
+            )}
+
+            {showEndTripButton && (
+              <TouchableOpacity style={styles.endTripButton} onPress={handleEndTrip} activeOpacity={0.8}>
+                <MaterialIcons name="flag" size={20} color="#ffffff" />
+                <Text style={styles.endTripButtonText}>End Trip</Text>
+              </TouchableOpacity>
+            )}
           </View>
 
           <View style={styles.tripInfoOverlay}>
             <View style={styles.tripInfoCard}>
+              {shouldShowGuidance ? (
+                <View style={styles.guidanceRow}>
+                  <MaterialIcons name={activeTurnIcon} size={22} color="#1f2937" style={styles.guidanceIcon} />
+                  <View style={styles.guidanceContent}>
+                    <Text style={styles.guidanceInstruction} numberOfLines={2}>
+                      {guidanceTitle}
+                    </Text>
+                    {activeStepDistance !== "" && (
+                      <Text style={styles.guidanceDistance}>{activeStepDistance}</Text>
+                    )}
+                  </View>
+                  <TouchableOpacity
+                    style={[styles.muteButton, { backgroundColor: ttsEnabled ? "#10b981" : "#ef4444" }]}
+                    onPress={toggleTTS}
+                    activeOpacity={0.8}
+                  >
+                    <MaterialIcons
+                      name={ttsEnabled ? "volume-up" : "volume-off"}
+                      size={16}
+                      color="#ffffff"
+                    />
+                  </TouchableOpacity>
+                </View>
+              ) : (
+                <View style={styles.guidancePlaceholder}>
+                  <MaterialIcons name="navigation" size={18} color="#6b7280" />
+                  <Text style={styles.guidancePlaceholderText}>Navigation ready</Text>
+                </View>
+              )}
+
               {mapMode === "toPickup" && (
                 <>
                   <View style={styles.locationRow}>
                     <MaterialIcons name="my-location" size={16} color="#F59E0B" />
                     <Text style={styles.locationText} numberOfLines={1}>
-                      Your Location
+                      Driver Location
                     </Text>
                   </View>
                   <View style={styles.locationDivider} />
@@ -1754,63 +2260,6 @@ const connectSocket = useCallback(() => {
                   </View>
                 </>
               )}
-
-              {mapMode === "full" && (
-                <>
-                  <View style={styles.locationRow}>
-                    <MaterialIcons name="my-location" size={16} color="#10b981" />
-                    <Text style={styles.locationText} numberOfLines={1}>
-                      {tripData?.pickupLocation}
-                    </Text>
-                  </View>
-                  <View style={styles.locationDivider} />
-                  <View style={styles.locationRow}>
-                    <MaterialIcons name="location-on" size={16} color="#ef4444" />
-                    <Text style={styles.locationText} numberOfLines={1}>
-                      {tripData?.dropLocation}
-                    </Text>
-                  </View>
-                </>
-              )}
-            </View>
-          </View>
-        </View>
-      </Modal>
-
-      {/* Reached Pickup Confirmation Modal */}
-      <Modal
-        visible={showReachedPickupModal}
-        transparent={true}
-        animationType="fade"
-        onRequestClose={() => setShowReachedPickupModal(false)}
-      >
-        <View style={styles.modalOverlay}>
-          <View style={styles.reachedPickupModal}>
-            <View style={styles.reachedPickupIconContainer}>
-              <MaterialIcons name="check-circle" size={60} color="#10b981" />
-            </View>
-            <Text style={styles.reachedPickupTitle}>Reached Pickup Location!</Text>
-            <Text style={styles.reachedPickupText}>
-              You have arrived at the pickup location. Ready to start the trip?
-            </Text>
-            <View style={styles.reachedPickupButtons}>
-              <TouchableOpacity
-                style={styles.reachedPickupCancelButton}
-                onPress={() => setShowReachedPickupModal(false)}
-              >
-                <Text style={styles.reachedPickupCancelText}>Not Yet</Text>
-              </TouchableOpacity>
-              <TouchableOpacity
-                style={styles.reachedPickupConfirmButton}
-                onPress={() => {
-                  setShowReachedPickupModal(false)
-                  setTripPhase("to_drop")
-                  setMapMode("pickupToDrop")
-                  handlePickupToDrop()
-                }}
-              >
-                <Text style={styles.reachedPickupConfirmText}>Start Trip</Text>
-              </TouchableOpacity>
             </View>
           </View>
         </View>
@@ -2074,43 +2523,83 @@ const styles = StyleSheet.create({
     shadowRadius: 6,
     elevation: 8,
   },
-  mapControlsContainer: {
+  overlayButtonsContainer: {
     position: "absolute",
-    bottom: 140,
+    bottom: 100,
     left: 20,
     right: 20,
-    flexDirection: "row",
-    justifyContent: "space-between",
-    zIndex: 100,
+    zIndex: 1000,
+    flexDirection: "column",
+    alignItems: "flex-start",
   },
-  mapControlButton: {
+  zoomToggleButton: {
     backgroundColor: "#ffffff",
+    borderRadius: 24,
+    padding: 12,
+    marginBottom: 12,
+    elevation: 4,
+    shadowColor: "#000",
+    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.2,
+    shadowRadius: 4,
+    borderWidth: 1,
+    borderColor: "#e5e7eb",
+  },
+  controlButton: {
+    backgroundColor: "#ffffff",
+    borderRadius: 20,
+    padding: 10,
+    marginBottom: 12,
+    elevation: 4,
+    shadowColor: "#000",
+    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.2,
+    shadowRadius: 4,
+    borderWidth: 1,
+    borderColor: "#e5e7eb",
+  },
+  startTripButton: {
+    backgroundColor: "#10b981",
     flexDirection: "row",
     alignItems: "center",
-    paddingVertical: 12,
-    paddingHorizontal: 16,
-    borderRadius: 25,
-    shadowColor: "#000",
-    shadowOffset: { width: 0, height: 3 },
-    shadowOpacity: 0.2,
-    shadowRadius: 6,
+    justifyContent: "center",
+    paddingVertical: 16,
+    paddingHorizontal: 24,
+    borderRadius: 12,
+    shadowColor: "#10b981",
+    shadowOffset: { width: 0, height: 4 },
+    shadowOpacity: 0.3,
+    shadowRadius: 8,
     elevation: 8,
-    borderWidth: 2,
-    borderColor: "#FEF3C7",
-    flex: 0.48,
+    alignSelf: "center",
   },
-  activeMapControlButton: {
-    backgroundColor: "#F59E0B",
-    borderColor: "#F59E0B",
-  },
-  mapControlText: {
-    marginLeft: 8,
-    fontSize: 14,
-    fontWeight: "600",
-    color: "#F59E0B",
-  },
-  activeMapControlText: {
+  startTripButtonText: {
     color: "#ffffff",
+    fontSize: 16,
+    fontWeight: "700",
+    marginLeft: 8,
+  },
+  endTripButton: {
+    backgroundColor: "#ef4444",
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "center",
+    paddingVertical: 16,
+    paddingHorizontal: 24,
+    borderRadius: 12,
+    shadowColor: "#ef4444",
+    shadowOffset: { width: 0, height: 4 },
+    shadowOpacity: 0.3,
+    shadowRadius: 8,
+    elevation: 8,
+    alignSelf: "center",
+    marginTop: 12,
+  },
+  endTripButtonText: {
+    color: "#ffffff",
+    fontSize: 16,
+    fontWeight: "700",
+    marginLeft: 8,
   },
   tripInfoOverlay: {
     position: "absolute",
@@ -2130,6 +2619,51 @@ const styles = StyleSheet.create({
     elevation: 12,
     borderWidth: 2,
     borderColor: "#FEF3C7",
+  },
+  guidanceRow: {
+    flexDirection: "row",
+    alignItems: "flex-start",
+    justifyContent: "space-between",
+    marginBottom: 12,
+  },
+  guidanceIcon: {
+    marginRight: 12,
+  },
+  guidanceContent: {
+    flex: 1,
+  },
+  guidanceInstruction: {
+    fontSize: 16,
+    fontWeight: "700",
+    color: "#1f2937",
+    marginBottom: 2,
+  },
+  guidanceDistance: {
+    fontSize: 13,
+    fontWeight: "600",
+    color: "#6b7280",
+  },
+  muteButton: {
+    padding: 8,
+    borderRadius: 16,
+    marginLeft: 8,
+    elevation: 2,
+    shadowColor: "#000",
+    shadowOffset: { width: 0, height: 1 },
+    shadowOpacity: 0.2,
+    shadowRadius: 2,
+  },
+  guidancePlaceholder: {
+    flexDirection: "row",
+    alignItems: "center",
+    paddingVertical: 6,
+    marginBottom: 12,
+  },
+  guidancePlaceholderText: {
+    marginLeft: 8,
+    fontSize: 13,
+    fontWeight: "600",
+    color: "#6b7280",
   },
   locationRow: {
     flexDirection: "row",
@@ -2257,69 +2791,10 @@ const styles = StyleSheet.create({
     color: "#ffffff",
     marginLeft: 4,
   },
-  modalOverlay: {
-    flex: 1,
-    backgroundColor: 'rgba(0, 0, 0, 0.5)',
-    justifyContent: 'center',
-    alignItems: 'center',
-  },
-  reachedPickupModal: {
-    backgroundColor: '#ffffff',
-    borderRadius: 20,
-    padding: 30,
-    width: '85%',
-    alignItems: 'center',
-    shadowColor: '#000',
-    shadowOffset: { width: 0, height: 4 },
-    shadowOpacity: 0.3,
-    shadowRadius: 8,
-    elevation: 10,
-  },
-  reachedPickupIconContainer: {
-    marginBottom: 20,
-  },
-  reachedPickupTitle: {
-    fontSize: 22,
-    fontWeight: 'bold',
-    color: '#1f2937',
-    marginBottom: 12,
-    textAlign: 'center',
-  },
-  reachedPickupText: {
-    fontSize: 16,
-    color: '#6b7280',
-    textAlign: 'center',
-    marginBottom: 24,
-    lineHeight: 24,
-  },
-  reachedPickupButtons: {
-    flexDirection: 'row',
-    gap: 12,
-    width: '100%',
-  },
-  reachedPickupCancelButton: {
-    flex: 1,
-    backgroundColor: '#f3f4f6',
-    paddingVertical: 14,
-    borderRadius: 12,
-    alignItems: 'center',
-  },
-  reachedPickupCancelText: {
-    fontSize: 16,
-    fontWeight: '600',
-    color: '#6b7280',
-  },
-  reachedPickupConfirmButton: {
-    flex: 1,
-    backgroundColor: '#10b981',
-    paddingVertical: 14,
-    borderRadius: 12,
-    alignItems: 'center',
-  },
-  reachedPickupConfirmText: {
-    fontSize: 16,
-    fontWeight: '600',
-    color: '#ffffff',
+  carMarkerImage: {
+    width: 70,
+    height: 90,
+    resizeMode: "contain",
   },
 })
 

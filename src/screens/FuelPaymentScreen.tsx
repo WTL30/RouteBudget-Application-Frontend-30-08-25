@@ -211,7 +211,7 @@ const FuelPaymentScreen: React.FC<FuelPaymentScreenProps> = ({ onClose, navigati
         return
       }
 
-      const response = await axios.get("http://192.168.1.25:5000/api/assignCab/driver", {
+      const response = await axios.get("https://api.routebudget.com/api/assignCab/driver", {
         headers: { Authorization: `Bearer ${token}` },
       })
 
@@ -297,7 +297,7 @@ const FuelPaymentScreen: React.FC<FuelPaymentScreenProps> = ({ onClose, navigati
         formData.append("receiptImage", imageData as any)
       }
 
-      const response = await axios.patch("http://192.168.1.25:5000/api/assigncab/update-trip", formData, {
+      const response = await axios.patch("https://api.routebudget.com/api/assigncab/update-trip", formData, {
         timeout: 30000,
         headers: {
           "Content-Type": "multipart/form-data",

@@ -43,7 +43,7 @@ const CabAssign = () => {
       }
   
       // Updated API endpoint for free cabs
-      const res = await axios.get("http://192.168.1.25:5000/api/assigncab/driver/free-cabs", {
+      const res = await axios.get("https://api.routebudget.com/api/assigncab/driver/free-cabs", {
         headers: { Authorization: `Bearer ${token}` }
       }); 
       console.log("res",res)
@@ -105,7 +105,7 @@ const CabAssign = () => {
   //     }
   
   //     const res = await axios.post(
-  //       "http://192.168.1.25:5000/api/assigncab/driver/cabassign",
+  //       "https://api.routebudget.com/api/assigncab/driver/cabassign",
   //       {
   //         cabNumber: selectedCabDetails.cabNumber,
   //         assignedBy: selectedCabDetails.addedBy
@@ -159,7 +159,7 @@ const CabAssign = () => {
     }
 
     const res = await axios.post(
-      "http://192.168.1.25:5000/api/assigncab/driver/cabassign",
+      "https://api.routebudget.com/api/assigncab/driver/cabassign",
       {
         cabNumber: selectedCabDetails.cabNumber,
         assignedBy: selectedCabDetails.addedBy  // This should be the admin/manager ID who added the cab

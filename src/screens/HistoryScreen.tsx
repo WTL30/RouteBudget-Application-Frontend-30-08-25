@@ -45,7 +45,7 @@ const HistoryScreen: React.FC = () => {
       ]);
 
       const driverId = storedDriverId || "11";
-      const url = `http://192.168.1.25:5000/api/assigncab/driver/${driverId}/completed`;
+      const url = `https://api.routebudget.com/api/assigncab/driver/${driverId}/completed`;
 
       const response = await axios.get(url, {
         headers: token

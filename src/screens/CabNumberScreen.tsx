@@ -29,7 +29,7 @@ const CabNumberScreen = ({ navigation }) => {
     
       
       if(token){
-        const response = await axios.get("http://192.168.1.25:5000/api/assignCab/driver",{headers:{
+        const response = await axios.get("https://api.routebudget.com/api/assignCab/driver",{headers:{
           Authorization:`Bearer ${token}`
         }});
         const assignedCab = response.data[0];
